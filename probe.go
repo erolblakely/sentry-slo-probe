@@ -14,34 +14,17 @@ type probeResult struct {
 }
 
 // probe sends a transaction to Sentry, then polls until it appears.
-// Returns the measured ingestion latency.
 func probe(s *sentryProbe, timeout, pollInterval time.Duration) (*probeResult, error) {
 	traceID, sentAt, err := s.sendTrace()
 	if err != nil {
 		return nil, fmt.Errorf("send trace: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("timed out waiting for trace %s to appear in Sentry (timeout=%s)", traceID, timeout)
-		case <-time.After(pollInterval):
-			found, err := s.traceExists(traceID)
-			if err != nil {
-				// Log but keep polling — transient API errors are common
-				continue
-			}
-			if found {
-				return &probeResult{
-					traceID: traceID,
-					latency: time.Since(sentAt),
-				}, nil
-			}
-		}
+	if err := pollUntil(timeout, pollInterval, func() (bool, error) {
+		return s.traceExists(traceID)
+	}); err != nil {
+		return nil, fmt.Errorf("trace %s: %w", traceID, err)
 	}
+	return &probeResult{traceID: traceID, latency: time.Since(sentAt)}, nil
 }
 
 type sentryProbe struct {
@@ -55,17 +38,21 @@ func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
 	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project}
 }
 
-// sendTrace initialises a fresh Sentry client, sends one transaction with
-// child spans, flushes it, then returns the trace ID and the time it was sent.
+// sendTrace sends one transaction with child spans and returns the trace ID and send time.
 func (s *sentryProbe) sendTrace() (traceID string, sentAt time.Time, err error) {
-	client, err := sentry.NewClient(sentry.ClientOptions{
+	return s.sendTraceWithSpans(4)
+}
+
+// sendTraceWithSpans sends a transaction with exactly n child spans.
+func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Time, err error) {
+	client, clientErr := sentry.NewClient(sentry.ClientOptions{
 		Dsn:              s.dsn,
 		TracesSampleRate: 1.0,
 		Environment:      "probe",
 		Release:          "sentry-slo-probe@1.0.0",
 	})
-	if err != nil {
-		return "", time.Time{}, fmt.Errorf("sentry client: %w", err)
+	if clientErr != nil {
+		return "", time.Time{}, fmt.Errorf("sentry client: %w", clientErr)
 	}
 
 	hub := sentry.NewHub(client, sentry.NewScope())
@@ -76,36 +63,61 @@ func (s *sentryProbe) sendTrace() (traceID string, sentAt time.Time, err error) 
 		sentry.WithDescription("Synthetic login probe for SLO measurement"),
 	)
 
-	// Simulate a login flow so the trace has realistic child spans
-	simulateProbeLogin(span)
+	for i := 0; i < n; i++ {
+		child := span.StartChild(fmt.Sprintf("probe.span.%d", i),
+			sentry.WithDescription(fmt.Sprintf("Probe child span %d", i)),
+		)
+		sleep(5, 20)
+		child.Status = sentry.SpanStatusOK
+		child.Finish()
+	}
 
 	span.Finish()
 	traceID = span.TraceID.String()
 	sentAt = time.Now()
-
-	// Block until the SDK has delivered the envelope
 	client.Flush(10 * time.Second)
-
 	return traceID, sentAt, nil
 }
 
-func simulateProbeLogin(parent *sentry.Span) {
-	steps := []struct {
-		op      string
-		desc    string
-		minMs   int
-		maxMs   int
-	}{
-		{"validate.input", "Validate email format", 5, 15},
-		{"db.query", "SELECT user by email", 30, 80},
-		{"auth.verify_password", "bcrypt comparison", 60, 120},
-		{"auth.generate_token", "Generate session token", 10, 30},
+// sendError sends a captured message event with a unique probe ID tag.
+func (s *sentryProbe) sendError() (probeID string, sentAt time.Time, err error) {
+	client, clientErr := sentry.NewClient(sentry.ClientOptions{
+		Dsn:         s.dsn,
+		Environment: "probe",
+		Release:     "sentry-slo-probe@1.0.0",
+	})
+	if clientErr != nil {
+		return "", time.Time{}, fmt.Errorf("sentry client: %w", clientErr)
 	}
 
-	for _, step := range steps {
-		child := parent.StartChild(step.op, sentry.WithDescription(step.desc))
-		sleep(step.minMs, step.maxMs)
-		child.Status = sentry.SpanStatusOK
-		child.Finish()
+	probeID = fmt.Sprintf("slo-probe-%d", time.Now().UnixNano())
+
+	hub := sentry.NewHub(client, sentry.NewScope())
+	hub.Scope().SetTag("probe_id", probeID)
+	hub.CaptureMessage("SLO error probe: " + probeID)
+
+	sentAt = time.Now()
+	client.Flush(10 * time.Second)
+	return probeID, sentAt, nil
+}
+
+// pollUntil retries checkFn every pollInterval until it returns true or timeout elapses.
+func pollUntil(timeout, pollInterval time.Duration, checkFn func() (bool, error)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out after %s", timeout)
+		case <-time.After(pollInterval):
+			found, err := checkFn()
+			if err != nil {
+				continue // transient — keep polling
+			}
+			if found {
+				return nil
+			}
+		}
 	}
 }
