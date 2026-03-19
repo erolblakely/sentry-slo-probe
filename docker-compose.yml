@@ -1,29 +1,17 @@
 services:
-  datadog-agent:
-    image: gcr.io/datadoghq/agent:7
-    environment:
-      DD_API_KEY: "${DD_API_KEY}"
-      DD_SITE: "${DD_SITE:-datadoghq.com}"
-      # Enable OTLP ingestion over gRPC (port 4317) and HTTP (port 4318)
-      DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT: "0.0.0.0:4317"
-      DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_HTTP_ENDPOINT: "0.0.0.0:4318"
-      DD_APM_ENABLED: "true"
-      DD_APM_NON_LOCAL_TRAFFIC: "true"
-      DD_LOGS_ENABLED: "true"
-    ports:
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-      - "8126:8126"   # APM agent port
-    healthcheck:
-      test: ["CMD", "agent", "health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  login-tracer:
+  sentry-slo-probe:
     build: .
     environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: "datadog-agent:4317"
-    depends_on:
-      datadog-agent:
-        condition: service_healthy
+      # Sentry — send synthetic traces
+      SENTRY_DSN: "${SENTRY_DSN}"
+      SENTRY_AUTH_TOKEN: "${SENTRY_AUTH_TOKEN}"
+      SENTRY_ORG: "${SENTRY_ORG}"
+      SENTRY_PROJECT: "${SENTRY_PROJECT}"
+      # Datadog — receive latency metrics
+      DD_API_KEY: "${DD_API_KEY}"
+      DD_SITE: "${DD_SITE:-datadoghq.com}"
+      # Tuning (optional)
+      PROBE_INTERVAL_SECONDS: "${PROBE_INTERVAL_SECONDS:-60}"
+      POLL_TIMEOUT_SECONDS: "${POLL_TIMEOUT_SECONDS:-120}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
+    restart: unless-stopped
