@@ -1,8 +1,6 @@
 services:
   sentry-slo-probe:
     build: .
-    ports:
-      - "${ALERT_WEBHOOK_PORT:-8080}:${ALERT_WEBHOOK_PORT:-8080}"
     environment:
       # Sentry — send synthetic events and poll for them
       SENTRY_DSN: "${SENTRY_DSN}"
@@ -16,7 +14,4 @@ services:
       PROBE_INTERVAL_SECONDS: "${PROBE_INTERVAL_SECONDS:-60}"
       POLL_TIMEOUT_SECONDS: "${POLL_TIMEOUT_SECONDS:-120}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
-      # Alert firing probe
-      ALERT_WEBHOOK_PORT: "${ALERT_WEBHOOK_PORT:-8080}"
-      ALERT_WEBHOOK_TIMEOUT_SECONDS: "${ALERT_WEBHOOK_TIMEOUT_SECONDS:-300}"
     restart: unless-stopped

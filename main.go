@@ -18,11 +18,6 @@ func main() {
 	s := newSentryProbe(cfg.sentryDSN, cfg.sentryAuthToken, cfg.sentryOrg, cfg.sentryProject)
 	dd := newDatadogClient(cfg.ddAPIKey, cfg.ddSite)
 
-	ws := newAlertWebhookServer(cfg.alertWebhookPort)
-	if err := ws.start(); err != nil {
-		log.Fatalf("webhook server: %v", err)
-	}
-
 	baseTags := []string{
 		fmt.Sprintf("sentry_org:%s", cfg.sentryOrg),
 		fmt.Sprintf("sentry_project:%s", cfg.sentryProject),
@@ -31,7 +26,7 @@ func main() {
 	log.Printf("Starting SLO probes (interval=%s)", cfg.interval)
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(3)
 
 	// Probe 1: trace ingestion latency
 	go runProbeLoop("trace_ingestion", cfg.interval, &wg, func() {
@@ -71,19 +66,6 @@ func main() {
 		dd.postMetric("sentry.span_completeness.received_pct", result.pct, append(baseTags, "probe:span_completeness"))
 	})
 
-	// Probe 4: alert firing latency
-	go runProbeLoop("alert_firing", cfg.interval, &wg, func() {
-		result, err := probeAlert(s, ws, cfg.alertWebhookTimeout)
-		if err != nil {
-			log.Printf("[alert_firing] ERROR: %v", err)
-			dd.postMetric("sentry.ingestion.error", 1, append(baseTags, "probe:alert_firing"))
-			return
-		}
-		ms := float64(result.latency.Milliseconds())
-		log.Printf("[alert_firing] latency=%s", result.latency)
-		dd.postMetric("sentry.alert_firing.latency_ms", ms, append(baseTags, "probe:alert_firing"))
-	})
-
 	wg.Wait()
 }
 
@@ -108,8 +90,6 @@ type config struct {
 	interval            time.Duration
 	pollTimeout         time.Duration
 	pollInterval        time.Duration
-	alertWebhookPort    int
-	alertWebhookTimeout time.Duration
 }
 
 func configFromEnv() (config, error) {
@@ -141,8 +121,6 @@ func configFromEnv() (config, error) {
 		interval:            envDuration("PROBE_INTERVAL_SECONDS", 60),
 		pollTimeout:         envDuration("POLL_TIMEOUT_SECONDS", 120),
 		pollInterval:        envDuration("POLL_INTERVAL_SECONDS", 5),
-		alertWebhookPort:    envInt("ALERT_WEBHOOK_PORT", 8080),
-		alertWebhookTimeout: envDuration("ALERT_WEBHOOK_TIMEOUT_SECONDS", 300),
 	}, nil
 }
 
@@ -153,13 +131,4 @@ func envDuration(key string, defaultSeconds int) time.Duration {
 		}
 	}
 	return time.Duration(defaultSeconds) * time.Second
-}
-
-func envInt(key string, defaultVal int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return defaultVal
 }
