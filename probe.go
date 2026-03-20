@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type probeResult struct {
@@ -13,18 +15,39 @@ type probeResult struct {
 	latency time.Duration
 }
 
-// probe sends a transaction to Sentry, then polls until it appears.
-func probe(s *sentryProbe, timeout, pollInterval time.Duration) (*probeResult, error) {
-	traceID, sentAt, err := s.sendTrace()
+// probe measures Sentry trace ingestion latency.
+func probe(ctx context.Context, s *sentryProbe, timeout, pollInterval time.Duration) (*probeResult, error) {
+	ctx, span := tracer.Start(ctx, "probe.trace_ingestion")
+	defer span.End()
+
+	var sentAt time.Time
+	traceID, err := timedSpan(ctx, "sentry.send_trace", func() (string, error) {
+		var id string
+		var err error
+		id, sentAt, err = s.sendTrace()
+		return id, err
+	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("send trace: %w", err)
 	}
-	if err := pollUntil(timeout, pollInterval, func() (bool, error) {
+	span.SetAttributes(attribute.String("sentry.trace_id", traceID))
+
+	attempts, err := pollWithSpan(ctx, "sentry.await_ingestion", timeout, pollInterval, func() (bool, error) {
 		return s.traceExists(traceID)
-	}); err != nil {
+	})
+	span.SetAttributes(attribute.Int("sentry.poll_attempts", attempts))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("trace %s: %w", traceID, err)
 	}
-	return &probeResult{traceID: traceID, latency: time.Since(sentAt)}, nil
+
+	latency := time.Since(sentAt)
+	span.SetAttributes(attribute.Int64("sentry.ingestion_latency_ms", latency.Milliseconds()))
+	span.SetStatus(codes.Ok, "")
+	return &probeResult{traceID: traceID, latency: latency}, nil
 }
 
 type sentryProbe struct {
@@ -38,12 +61,10 @@ func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
 	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project}
 }
 
-// sendTrace sends one transaction with child spans and returns the trace ID and send time.
 func (s *sentryProbe) sendTrace() (traceID string, sentAt time.Time, err error) {
 	return s.sendTraceWithSpans(4)
 }
 
-// sendTraceWithSpans sends a transaction with exactly n child spans.
 func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Time, err error) {
 	client, clientErr := sentry.NewClient(sentry.ClientOptions{
 		Dsn:              s.dsn,
@@ -62,7 +83,6 @@ func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Tim
 		sentry.WithOpName("slo.probe"),
 		sentry.WithDescription("Synthetic login probe for SLO measurement"),
 	)
-
 	for i := 0; i < n; i++ {
 		child := span.StartChild(fmt.Sprintf("probe.span.%d", i),
 			sentry.WithDescription(fmt.Sprintf("Probe child span %d", i)),
@@ -71,7 +91,6 @@ func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Tim
 		child.Status = sentry.SpanStatusOK
 		child.Finish()
 	}
-
 	span.Finish()
 	traceID = span.TraceID.String()
 	sentAt = time.Now()
@@ -79,7 +98,6 @@ func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Tim
 	return traceID, sentAt, nil
 }
 
-// sendError sends a captured message event with a unique probe ID tag.
 func (s *sentryProbe) sendError() (probeID string, sentAt time.Time, err error) {
 	client, clientErr := sentry.NewClient(sentry.ClientOptions{
 		Dsn:         s.dsn,
@@ -91,33 +109,62 @@ func (s *sentryProbe) sendError() (probeID string, sentAt time.Time, err error) 
 	}
 
 	probeID = fmt.Sprintf("slo-probe-%d", time.Now().UnixNano())
-
 	hub := sentry.NewHub(client, sentry.NewScope())
 	hub.Scope().SetTag("probe_id", probeID)
 	hub.CaptureMessage("SLO error probe: " + probeID)
-
 	sentAt = time.Now()
 	client.Flush(10 * time.Second)
 	return probeID, sentAt, nil
 }
 
-// pollUntil retries checkFn every pollInterval until it returns true or timeout elapses.
-func pollUntil(timeout, pollInterval time.Duration, checkFn func() (bool, error)) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// pollUntil retries checkFn every pollInterval until it returns true or the
+// context deadline is exceeded. Returns the number of attempts made.
+func pollUntil(ctx context.Context, timeout, pollInterval time.Duration, checkFn func() (bool, error)) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	attempts := 0
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timed out after %s", timeout)
+			return attempts, fmt.Errorf("timed out after %s (%d attempts)", timeout, attempts)
 		case <-time.After(pollInterval):
+			attempts++
 			found, err := checkFn()
 			if err != nil {
-				continue // transient — keep polling
+				continue
 			}
 			if found {
-				return nil
+				return attempts, nil
 			}
 		}
 	}
+}
+
+// pollWithSpan wraps pollUntil in an OTel span.
+func pollWithSpan(ctx context.Context, spanName string, timeout, pollInterval time.Duration, checkFn func() (bool, error)) (int, error) {
+	ctx, span := tracer.Start(ctx, spanName)
+	defer span.End()
+	attempts, err := pollUntil(ctx, timeout, pollInterval, checkFn)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetStatus(codes.Ok, "")
+	}
+	return attempts, err
+}
+
+// timedSpan runs fn inside a new child span, returning its result.
+func timedSpan(ctx context.Context, spanName string, fn func() (string, error)) (string, error) {
+	_, span := tracer.Start(ctx, spanName)
+	defer span.End()
+	result, err := fn()
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetStatus(codes.Ok, "")
+	}
+	return result, err
 }

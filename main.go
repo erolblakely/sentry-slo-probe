@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+
+	ctx := context.Background()
+
+	tp, err := initTracer(ctx, cfg.ddAPIKey, cfg.ddSite)
+	if err != nil {
+		log.Fatalf("init tracer: %v", err)
+	}
+	defer tp.Shutdown(ctx)
 
 	s := newSentryProbe(cfg.sentryDSN, cfg.sentryAuthToken, cfg.sentryOrg, cfg.sentryProject)
 	dd := newDatadogClient(cfg.ddAPIKey, cfg.ddSite)
@@ -29,34 +38,32 @@ func main() {
 	wg.Add(3)
 
 	// Probe 1: trace ingestion latency
-	go runProbeLoop("trace_ingestion", cfg.interval, &wg, func() {
-		result, err := probe(s, cfg.pollTimeout, cfg.pollInterval)
+	go runProbeLoop("trace_ingestion", cfg.interval, &wg, func(ctx context.Context) {
+		result, err := probe(ctx, s, cfg.pollTimeout, cfg.pollInterval)
 		if err != nil {
 			log.Printf("[trace_ingestion] ERROR: %v", err)
 			dd.postMetric("sentry.ingestion.error", 1, append(baseTags, "probe:trace_ingestion"))
 			return
 		}
-		ms := float64(result.latency.Milliseconds())
 		log.Printf("[trace_ingestion] latency=%s", result.latency)
-		dd.postMetric("sentry.ingestion.latency_ms", ms, append(baseTags, "probe:trace_ingestion"))
+		dd.postMetric("sentry.ingestion.latency_ms", float64(result.latency.Milliseconds()), append(baseTags, "probe:trace_ingestion"))
 	})
 
 	// Probe 2: error ingestion latency
-	go runProbeLoop("error_ingestion", cfg.interval, &wg, func() {
-		result, err := probeError(s, cfg.pollTimeout, cfg.pollInterval)
+	go runProbeLoop("error_ingestion", cfg.interval, &wg, func(ctx context.Context) {
+		result, err := probeError(ctx, s, cfg.pollTimeout, cfg.pollInterval)
 		if err != nil {
 			log.Printf("[error_ingestion] ERROR: %v", err)
 			dd.postMetric("sentry.ingestion.error", 1, append(baseTags, "probe:error_ingestion"))
 			return
 		}
-		ms := float64(result.latency.Milliseconds())
 		log.Printf("[error_ingestion] latency=%s", result.latency)
-		dd.postMetric("sentry.error_ingestion.latency_ms", ms, append(baseTags, "probe:error_ingestion"))
+		dd.postMetric("sentry.error_ingestion.latency_ms", float64(result.latency.Milliseconds()), append(baseTags, "probe:error_ingestion"))
 	})
 
 	// Probe 3: span completeness
-	go runProbeLoop("span_completeness", cfg.interval, &wg, func() {
-		result, err := probeSpans(s, cfg.pollTimeout, cfg.pollInterval)
+	go runProbeLoop("span_completeness", cfg.interval, &wg, func(ctx context.Context) {
+		result, err := probeSpans(ctx, s, cfg.pollTimeout, cfg.pollInterval)
 		if err != nil {
 			log.Printf("[span_completeness] ERROR: %v", err)
 			dd.postMetric("sentry.ingestion.error", 1, append(baseTags, "probe:span_completeness"))
@@ -69,27 +76,27 @@ func main() {
 	wg.Wait()
 }
 
-func runProbeLoop(name string, interval time.Duration, wg *sync.WaitGroup, fn func()) {
+func runProbeLoop(name string, interval time.Duration, wg *sync.WaitGroup, fn func(context.Context)) {
 	defer wg.Done()
 	log.Printf("[%s] starting (interval=%s)", name, interval)
-	fn() // run immediately on start
+	fn(context.Background())
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		fn()
+		fn(context.Background())
 	}
 }
 
 type config struct {
-	sentryDSN           string
-	sentryAuthToken     string
-	sentryOrg           string
-	sentryProject       string
-	ddAPIKey            string
-	ddSite              string
-	interval            time.Duration
-	pollTimeout         time.Duration
-	pollInterval        time.Duration
+	sentryDSN       string
+	sentryAuthToken string
+	sentryOrg       string
+	sentryProject   string
+	ddAPIKey        string
+	ddSite          string
+	interval        time.Duration
+	pollTimeout     time.Duration
+	pollInterval    time.Duration
 }
 
 func configFromEnv() (config, error) {
@@ -112,15 +119,15 @@ func configFromEnv() (config, error) {
 	}
 
 	return config{
-		sentryDSN:           required["SENTRY_DSN"],
-		sentryAuthToken:     required["SENTRY_AUTH_TOKEN"],
-		sentryOrg:           required["SENTRY_ORG"],
-		sentryProject:       required["SENTRY_PROJECT"],
-		ddAPIKey:            required["DD_API_KEY"],
-		ddSite:              ddSite,
-		interval:            envDuration("PROBE_INTERVAL_SECONDS", 60),
-		pollTimeout:         envDuration("POLL_TIMEOUT_SECONDS", 120),
-		pollInterval:        envDuration("POLL_INTERVAL_SECONDS", 5),
+		sentryDSN:       required["SENTRY_DSN"],
+		sentryAuthToken: required["SENTRY_AUTH_TOKEN"],
+		sentryOrg:       required["SENTRY_ORG"],
+		sentryProject:   required["SENTRY_PROJECT"],
+		ddAPIKey:        required["DD_API_KEY"],
+		ddSite:          ddSite,
+		interval:        envDuration("PROBE_INTERVAL_SECONDS", 60),
+		pollTimeout:     envDuration("POLL_TIMEOUT_SECONDS", 120),
+		pollInterval:    envDuration("POLL_INTERVAL_SECONDS", 5),
 	}, nil
 }
 
