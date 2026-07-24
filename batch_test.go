@@ -33,3 +33,22 @@ func TestPercentile(t *testing.T) {
 		t.Errorf("percentile mutated input slice")
 	}
 }
+
+func TestSendOffsets(t *testing.T) {
+	got := sendOffsets(4, 100*time.Second)
+	want := []time.Duration{0, 25 * time.Second, 50 * time.Second, 75 * time.Second}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("offset[%d] = %s, want %s", i, got[i], want[i])
+		}
+	}
+	if one := sendOffsets(1, 100*time.Second); len(one) != 1 || one[0] != 0 {
+		t.Errorf("sendOffsets(1) = %v, want [0]", one)
+	}
+	if zero := sendOffsets(0, time.Second); zero != nil {
+		t.Errorf("sendOffsets(0) = %v, want nil", zero)
+	}
+}

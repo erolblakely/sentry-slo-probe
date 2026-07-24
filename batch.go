@@ -24,3 +24,18 @@ func percentile(latencies []time.Duration, p float64) time.Duration {
 	}
 	return sorted[rank]
 }
+
+// sendOffsets returns size offsets from the batch start, evenly spaced across
+// window with step window/size (so the last send leaves headroom before the
+// window closes). Returns nil for size <= 0.
+func sendOffsets(size int, window time.Duration) []time.Duration {
+	if size <= 0 {
+		return nil
+	}
+	offsets := make([]time.Duration, size)
+	step := window / time.Duration(size)
+	for i := range offsets {
+		offsets[i] = time.Duration(i) * step
+	}
+	return offsets
+}
