@@ -20,9 +20,12 @@ var tracer trace.Tracer
 // intake and sets it as the global OTel TracerProvider.
 func initTracer(ctx context.Context, ddAPIKey, ddSite string) (*sdktrace.TracerProvider, error) {
 	exporter, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithEndpoint(fmt.Sprintf("api.%s", ddSite)),
-		otlptracehttp.WithURLPath("/api/intake/otlp/v1/traces"),
-		otlptracehttp.WithHeaders(map[string]string{"DD-API-KEY": ddAPIKey}),
+		otlptracehttp.WithEndpoint(fmt.Sprintf("otlp.%s", ddSite)),
+		otlptracehttp.WithURLPath("/v1/traces"),
+		otlptracehttp.WithHeaders(map[string]string{
+			"DD-API-KEY":    ddAPIKey,
+			"compute_stats": "true", // have Datadog compute APM trace metrics from these spans
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("otlp exporter: %w", err)

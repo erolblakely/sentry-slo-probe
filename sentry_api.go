@@ -11,6 +11,23 @@ import (
 
 var sentryHTTP = &http.Client{Timeout: 10 * time.Second}
 
+// apiError is a non-2xx response from the Sentry API.
+type apiError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("sentry api %d: %s", e.StatusCode, e.Body)
+}
+
+// permanent reports whether retrying is futile. 4xx client errors (auth,
+// permission, bad request) won't recover — except 429, which is a transient
+// rate-limit signal that we should keep retrying.
+func (e *apiError) permanent() bool {
+	return e.StatusCode >= 400 && e.StatusCode < 500 && e.StatusCode != http.StatusTooManyRequests
+}
+
 // traceExists checks whether a transaction with the given trace ID has been ingested.
 func (s *sentryProbe) traceExists(traceID string) (bool, error) {
 	_, eventID, err := s.findTrace(traceID)
@@ -69,13 +86,27 @@ func (s *sentryProbe) fetchEventSpanCount(eventID string) (int, error) {
 	endpoint := fmt.Sprintf("https://sentry.io/api/0/projects/%s/%s/events/%s/",
 		url.PathEscape(s.org), url.PathEscape(s.project), url.PathEscape(eventID))
 
+	// A transaction event's child spans live under entries[type=="spans"].data,
+	// not a top-level "spans" field.
 	var event struct {
-		Spans []json.RawMessage `json:"spans"`
+		Entries []struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		} `json:"entries"`
 	}
 	if err := s.get(endpoint, &event); err != nil {
 		return 0, err
 	}
-	return len(event.Spans), nil
+	for _, e := range event.Entries {
+		if e.Type == "spans" {
+			var spans []json.RawMessage
+			if err := json.Unmarshal(e.Data, &spans); err != nil {
+				return 0, fmt.Errorf("decode spans entry: %w", err)
+			}
+			return len(spans), nil
+		}
+	}
+	return 0, nil
 }
 
 func (s *sentryProbe) get(endpoint string, out any) error {
@@ -94,7 +125,7 @@ func (s *sentryProbe) get(endpoint string, out any) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("sentry api %d: %s", resp.StatusCode, string(body))
+		return &apiError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
