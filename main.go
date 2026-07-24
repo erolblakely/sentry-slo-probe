@@ -97,6 +97,9 @@ type config struct {
 	interval        time.Duration
 	pollTimeout     time.Duration
 	pollInterval    time.Duration
+	batchSize       int
+	sendWindow      time.Duration
+	spanSample      int
 }
 
 func configFromEnv() (config, error) {
@@ -125,9 +128,12 @@ func configFromEnv() (config, error) {
 		sentryProject:   required["SENTRY_PROJECT"],
 		ddAPIKey:        required["DD_API_KEY"],
 		ddSite:          ddSite,
-		interval:        envDuration("PROBE_INTERVAL_SECONDS", 60),
+		interval:        envDuration("PROBE_INTERVAL_SECONDS", 120),
 		pollTimeout:     envDuration("POLL_TIMEOUT_SECONDS", 120),
 		pollInterval:    envDuration("POLL_INTERVAL_SECONDS", 5),
+		batchSize:       envInt("PROBE_BATCH_SIZE", 100),
+		sendWindow:      envDuration("PROBE_SEND_WINDOW_SECONDS", 100),
+		spanSample:      envInt("SPAN_COMPLETENESS_SAMPLE", 20),
 	}, nil
 }
 
@@ -138,4 +144,13 @@ func envDuration(key string, defaultSeconds int) time.Duration {
 		}
 	}
 	return time.Duration(defaultSeconds) * time.Second
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
 }
