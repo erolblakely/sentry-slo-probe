@@ -86,3 +86,17 @@ func TestLatencyTrackerSuccessivePolls(t *testing.T) {
 		t.Errorf("latencies = %v, want {5s,8s}", res.latencies)
 	}
 }
+
+func TestBatchDone(t *testing.T) {
+	last := time.Unix(2000, 0)
+	to := 60 * time.Second
+	if !batchDone(10, 10, last, last, to) {
+		t.Error("all received should be done")
+	}
+	if batchDone(5, 10, last.Add(30*time.Second), last, to) {
+		t.Error("partial before timeout should not be done")
+	}
+	if !batchDone(5, 10, last.Add(61*time.Second), last, to) {
+		t.Error("partial past timeout should be done")
+	}
+}

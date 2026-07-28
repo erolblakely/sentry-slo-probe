@@ -88,3 +88,12 @@ func (t *latencyTracker) result(sent int) batchResult {
 	}
 	return batchResult{sent: sent, received: len(t.latencies), latencies: out}
 }
+
+// batchDone reports whether polling should stop: either every sent event has
+// been received, or we are past the drain deadline (lastSendAt + pollTimeout).
+func batchDone(received, size int, now, lastSendAt time.Time, pollTimeout time.Duration) bool {
+	if received >= size {
+		return true
+	}
+	return now.After(lastSendAt.Add(pollTimeout))
+}
