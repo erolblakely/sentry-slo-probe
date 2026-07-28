@@ -39,3 +39,52 @@ func sendOffsets(size int, window time.Duration) []time.Duration {
 	}
 	return offsets
 }
+
+// batchResult is the outcome of one batch run.
+type batchResult struct {
+	sent      int
+	received  int
+	latencies []time.Duration
+}
+
+// latencyTracker records per-id send times and, on each poll, the latency of
+// ids seen for the first time. Not safe for concurrent use; callers guard it.
+type latencyTracker struct {
+	sentAt    map[string]time.Time
+	latencies map[string]time.Duration
+}
+
+func newLatencyTracker() *latencyTracker {
+	return &latencyTracker{
+		sentAt:    make(map[string]time.Time),
+		latencies: make(map[string]time.Duration),
+	}
+}
+
+func (t *latencyTracker) markSent(id string, at time.Time) {
+	t.sentAt[id] = at
+}
+
+func (t *latencyTracker) observe(found map[string]bool, now time.Time) int {
+	n := 0
+	for id := range found {
+		if _, done := t.latencies[id]; done {
+			continue
+		}
+		if sent, ok := t.sentAt[id]; ok {
+			t.latencies[id] = now.Sub(sent)
+			n++
+		}
+	}
+	return n
+}
+
+func (t *latencyTracker) receivedCount() int { return len(t.latencies) }
+
+func (t *latencyTracker) result(sent int) batchResult {
+	out := make([]time.Duration, 0, len(t.latencies))
+	for _, d := range t.latencies {
+		out = append(out, d)
+	}
+	return batchResult{sent: sent, received: len(t.latencies), latencies: out}
+}
