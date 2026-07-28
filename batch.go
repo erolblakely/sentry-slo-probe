@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"log"
 	"math"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -96,4 +99,106 @@ func batchDone(received, size int, now, lastSendAt time.Time, pollTimeout time.D
 		return true
 	}
 	return now.After(lastSendAt.Add(pollTimeout))
+}
+
+// sentCount returns how many distinct ids were marked sent. markSent is only
+// called for sends that succeeded, so this is the denominator for
+// success_rate = received / sent: the rate must measure Sentry's ingestion
+// reliability, not our own send failures, which would otherwise read as Sentry
+// dropping events. Send-failure volume stays visible as the gap between this
+// and the configured batch size. Not safe for concurrent use; callers guard it.
+func (t *latencyTracker) sentCount() int { return len(t.sentAt) }
+
+// sendFunc sends one event (identified by seq) and returns the id used to find
+// it later plus the local send time.
+type sendFunc func(ctx context.Context, seq int) (id string, sentAt time.Time, err error)
+
+// queryFunc returns the set of batch ids ingested so far.
+type queryFunc func(ctx context.Context) (map[string]bool, error)
+
+type batchConfig struct {
+	size         int
+	sendWindow   time.Duration
+	pollTimeout  time.Duration
+	pollInterval time.Duration
+	sendWorkers  int
+}
+
+// runBatch paces cfg.size sends across cfg.sendWindow while polling query every
+// cfg.pollInterval, recording per-event latency, until all are received or the
+// drain deadline passes.
+func runBatch(ctx context.Context, cfg batchConfig, send sendFunc, query queryFunc) batchResult {
+	tracker := newLatencyTracker()
+	var mu sync.Mutex
+	offsets := sendOffsets(cfg.size, cfg.sendWindow)
+	start := time.Now()
+
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		workers := cfg.sendWorkers
+		if workers <= 0 {
+			workers = 1
+		}
+		sem := make(chan struct{}, workers)
+		var wg sync.WaitGroup
+		for i := 0; i < cfg.size; i++ {
+			if wait := offsets[i] - time.Since(start); wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					wg.Wait()
+					return
+				}
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(seq int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				id, at, err := send(ctx, seq)
+				if err != nil {
+					log.Printf("[batch] send seq=%d: %v", seq, err)
+					return
+				}
+				mu.Lock()
+				tracker.markSent(id, at)
+				mu.Unlock()
+			}(i)
+		}
+		wg.Wait()
+	}()
+
+	lastSendAt := start.Add(cfg.sendWindow)
+	ticker := time.NewTicker(cfg.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			<-sendDone
+			mu.Lock()
+			defer mu.Unlock()
+			return tracker.result(tracker.sentCount())
+		case <-ticker.C:
+			found, err := query(ctx)
+			now := time.Now()
+			mu.Lock()
+			if err != nil {
+				log.Printf("[batch] query: %v", err)
+			} else {
+				tracker.observe(found, now)
+			}
+			received := tracker.receivedCount()
+			mu.Unlock()
+			// batchDone asks about the intended size, not the successful sends:
+			// a batch whose sends partly failed should still drain to the
+			// deadline rather than stop early.
+			if batchDone(received, cfg.size, now, lastSendAt, cfg.pollTimeout) {
+				<-sendDone
+				mu.Lock()
+				defer mu.Unlock()
+				return tracker.result(tracker.sentCount())
+			}
+		}
+	}
 }

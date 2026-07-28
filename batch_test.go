@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -98,5 +101,55 @@ func TestBatchDone(t *testing.T) {
 	}
 	if !batchDone(5, 10, last.Add(61*time.Second), last, to) {
 		t.Error("partial past timeout should be done")
+	}
+}
+
+func TestRunBatchAllArrive(t *testing.T) {
+	cfg := batchConfig{
+		size: 5, sendWindow: 40 * time.Millisecond,
+		pollTimeout: 200 * time.Millisecond, pollInterval: 10 * time.Millisecond,
+		sendWorkers: 3,
+	}
+	var sent sync.Map
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		id := "e" + string(rune('0'+seq))
+		sent.Store(id, true)
+		return id, time.Now(), nil
+	}
+	query := func(ctx context.Context) (map[string]bool, error) {
+		found := map[string]bool{}
+		sent.Range(func(k, _ any) bool { found[k.(string)] = true; return true })
+		return found, nil
+	}
+	res := runBatch(context.Background(), cfg, send, query)
+	if res.sent != 5 || res.received != 5 || len(res.latencies) != 5 {
+		t.Fatalf("result = %+v, want sent=received=5", res)
+	}
+}
+
+func TestRunBatchTimeoutNoneArrive(t *testing.T) {
+	cfg := batchConfig{
+		size: 3, sendWindow: 10 * time.Millisecond,
+		pollTimeout: 30 * time.Millisecond, pollInterval: 5 * time.Millisecond,
+		sendWorkers: 2,
+	}
+	var calls int64
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		return "x", time.Now(), nil
+	}
+	query := func(ctx context.Context) (map[string]bool, error) {
+		atomic.AddInt64(&calls, 1)
+		return map[string]bool{}, nil // nothing ever arrives
+	}
+	start := time.Now()
+	res := runBatch(context.Background(), cfg, send, query)
+	if res.received != 0 {
+		t.Fatalf("received = %d, want 0", res.received)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("runBatch took %s, expected to stop near drain deadline", elapsed)
+	}
+	if atomic.LoadInt64(&calls) == 0 {
+		t.Fatal("query never called")
 	}
 }
