@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -151,5 +152,51 @@ func TestRunBatchTimeoutNoneArrive(t *testing.T) {
 	}
 	if atomic.LoadInt64(&calls) == 0 {
 		t.Fatal("query never called")
+	}
+}
+
+// errSendFailed stands in for a local send failure (network blip, transport
+// error) in tests -- the class of failure that must not be blamed on Sentry.
+var errSendFailed = errors.New("send failed")
+
+// TestRunBatchFailedSendsExcludedFromSent pins the rule that res.sent counts
+// only sends that succeeded, so success_rate = received/sent measures Sentry's
+// ingestion rather than our own local send failures. Here 2 of 4 sends fail
+// locally and both surviving events arrive, which must read as 2/2 (100%) --
+// not 2/4, which would look like Sentry dropping half the batch.
+//
+// cfg.size stays 4 so received (max 2) never reaches size: the run must stop via
+// the drain deadline (sendWindow+pollTimeout ~= 80ms), which also keeps this
+// test bounded rather than hanging on regression.
+func TestRunBatchFailedSendsExcludedFromSent(t *testing.T) {
+	cfg := batchConfig{
+		size: 4, sendWindow: 20 * time.Millisecond,
+		pollTimeout: 60 * time.Millisecond, pollInterval: 5 * time.Millisecond,
+		sendWorkers: 2,
+	}
+	var delivered sync.Map
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		if seq >= 2 {
+			return "", time.Time{}, errSendFailed
+		}
+		id := "ok" + string(rune('0'+seq))
+		delivered.Store(id, true)
+		return id, time.Now(), nil
+	}
+	query := func(ctx context.Context) (map[string]bool, error) {
+		found := map[string]bool{}
+		delivered.Range(func(k, _ any) bool { found[k.(string)] = true; return true })
+		return found, nil
+	}
+	start := time.Now()
+	res := runBatch(context.Background(), cfg, send, query)
+	if res.sent != 2 {
+		t.Errorf("sent = %d, want 2 (failed sends must not count toward sent)", res.sent)
+	}
+	if res.received != 2 || len(res.latencies) != 2 {
+		t.Errorf("received = %d, latencies = %d, want 2 and 2", res.received, len(res.latencies))
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("runBatch took %s, expected to stop near drain deadline", elapsed)
 	}
 }
