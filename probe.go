@@ -56,10 +56,11 @@ type sentryProbe struct {
 	authToken string
 	org       string
 	project   string
+	baseURL   string
 }
 
 func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
-	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project}
+	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project, baseURL: "https://sentry.io"}
 }
 
 func (s *sentryProbe) sendTrace() (traceID string, sentAt time.Time, err error) {
