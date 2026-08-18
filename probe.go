@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -55,10 +56,11 @@ type sentryProbe struct {
 	authToken string
 	org       string
 	project   string
+	baseURL   string
 }
 
 func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
-	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project}
+	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project, baseURL: "https://sentry.io"}
 }
 
 func (s *sentryProbe) sendTrace() (traceID string, sentAt time.Time, err error) {
@@ -68,6 +70,7 @@ func (s *sentryProbe) sendTrace() (traceID string, sentAt time.Time, err error) 
 func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Time, err error) {
 	client, clientErr := sentry.NewClient(sentry.ClientOptions{
 		Dsn:              s.dsn,
+		EnableTracing:    true, // required in sentry-go v0.x; without it transactions are dropped (SampledFalse)
 		TracesSampleRate: 1.0,
 		Environment:      "probe",
 		Release:          "sentry-slo-probe@1.0.0",
@@ -124,14 +127,26 @@ func pollUntil(ctx context.Context, timeout, pollInterval time.Duration, checkFn
 	defer cancel()
 
 	attempts := 0
+	var lastErr error
 	for {
 		select {
 		case <-ctx.Done():
+			if lastErr != nil {
+				return attempts, fmt.Errorf("timed out after %s (%d attempts); last error: %w", timeout, attempts, lastErr)
+			}
 			return attempts, fmt.Errorf("timed out after %s (%d attempts)", timeout, attempts)
 		case <-time.After(pollInterval):
 			attempts++
 			found, err := checkFn()
 			if err != nil {
+				lastErr = err
+				// A permanent client error (bad auth, missing scope, bad
+				// request) will never succeed — stop instead of polling to
+				// the deadline and hiding it behind a timeout.
+				var apiErr *apiError
+				if errors.As(err, &apiErr) && apiErr.permanent() {
+					return attempts, fmt.Errorf("permanent error after %d attempts: %w", attempts, err)
+				}
 				continue
 			}
 			if found {
