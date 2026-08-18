@@ -1,3 +1,6 @@
 .env
 login-tracer
 slo-login-tracer
+
+# Local agent/session state — never published
+.claude/
