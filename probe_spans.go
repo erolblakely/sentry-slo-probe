@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -91,4 +92,54 @@ func probeSpans(ctx context.Context, s *sentryProbe, timeout, pollInterval time.
 		pct:           pct,
 		latency:       latency,
 	}, nil
+}
+
+// probeSpansBatch runs a batch of transactions and, on a sample of arrived
+// transactions, measures span completeness. The second return is the sampled
+// completeness percentage.
+func probeSpansBatch(ctx context.Context, s *sentryProbe, cfg config, batchID string) (batchResult, float64) {
+	client, err := newTracingClient(s.dsn)
+	if err != nil {
+		log.Printf("[span_completeness] client: %v", err)
+		// sent counts sends that actually succeeded. Nothing left the process,
+		// so sent stays 0 — reporting cfg.batchSize here would read on the
+		// dashboard as Sentry dropping a full batch it never received.
+		return batchResult{}, 0
+	}
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		return sendTraceTagged(client, batchID, seq, expectedSpans)
+	}
+	query := func(ctx context.Context) (map[string]bool, error) {
+		return s.findBatch("transactions", batchID, "trace", cfg.batchSize)
+	}
+	res := runBatch(ctx, batchConfigFrom(cfg), send, query)
+
+	// Sampled completeness: fetch span detail for up to spanSample arrived txns.
+	// One request per sampled event, so the sample bounds the API cost
+	// independently of batch size.
+	ids, err := s.findBatchEventIDs(batchID, cfg.batchSize)
+	if err != nil {
+		log.Printf("[span_completeness] event ids: %v", err)
+		return res, 0
+	}
+	sample, complete := 0, 0
+	for _, eventID := range ids {
+		if sample >= cfg.spanSample {
+			break
+		}
+		sample++
+		n, err := s.fetchEventSpanCount(eventID)
+		if err != nil {
+			log.Printf("[span_completeness] span count: %v", err)
+			continue
+		}
+		if n >= expectedSpans {
+			complete++
+		}
+	}
+	pct := 0.0
+	if sample > 0 {
+		pct = float64(complete) / float64(sample) * 100
+	}
+	return res, pct
 }

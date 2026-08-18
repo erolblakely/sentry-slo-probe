@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strconv"
 	"time"
 
 	"github.com/getsentry/sentry-go"
@@ -182,4 +184,71 @@ func timedSpan(ctx context.Context, spanName string, fn func() (string, error)) 
 		span.SetStatus(codes.Ok, "")
 	}
 	return result, err
+}
+
+// newTracingClient builds a client for transaction probes. EnableTracing is
+// required in sentry-go v0.x; without it transactions are dropped
+// (SampledFalse).
+func newTracingClient(dsn string) (*sentry.Client, error) {
+	return sentry.NewClient(sentry.ClientOptions{
+		Dsn:              dsn,
+		EnableTracing:    true,
+		TracesSampleRate: 1.0,
+		Environment:      "probe",
+		Release:          "sentry-slo-probe@1.0.0",
+	})
+}
+
+// sendTraceTagged sends one probe transaction with n child spans, tagged for
+// batch identification, using the supplied client. Returns the trace id.
+//
+// The returned id is the batch's lookup key, so it must match byte-for-byte
+// what findBatch reads out of the "trace" field of a Discover row. Both sides
+// are 32 lowercase hex characters with no separators: TraceID.String() is
+// hex.Encode of the raw 16 bytes, and Sentry's "trace" field is the same
+// encoding. Do not reformat either side without changing the other.
+func sendTraceTagged(client *sentry.Client, batchID string, seq, n int) (string, time.Time, error) {
+	hub := sentry.NewHub(client, sentry.NewScope())
+	hub.Scope().SetTag("probe_batch", batchID)
+	hub.Scope().SetTag("probe_seq", strconv.Itoa(seq))
+	ctx := sentry.SetHubOnContext(context.Background(), hub)
+
+	span := sentry.StartTransaction(ctx, "probe.login",
+		sentry.WithOpName("slo.probe"),
+		sentry.WithDescription("Synthetic login probe for SLO measurement"),
+	)
+	// The transaction carries the tag itself as well as via the scope: findBatch
+	// filters on probe_batch, and a scope tag alone is not guaranteed to land on
+	// the transaction event.
+	span.SetTag("probe_batch", batchID)
+	for i := 0; i < n; i++ {
+		child := span.StartChild(fmt.Sprintf("probe.span.%d", i))
+		sleep(5, 20)
+		child.Status = sentry.SpanStatusOK
+		child.Finish()
+	}
+	span.Finish()
+	traceID := span.TraceID.String()
+	client.Flush(10 * time.Second)
+	return traceID, time.Now(), nil
+}
+
+// probeBatch sends a paced batch of probe transactions and measures ingestion
+// latency + reliability by trace id.
+func probeBatch(ctx context.Context, s *sentryProbe, cfg config, batchID string) batchResult {
+	client, err := newTracingClient(s.dsn)
+	if err != nil {
+		log.Printf("[trace_ingestion] client: %v", err)
+		// sent counts sends that actually succeeded. Nothing left the process,
+		// so sent stays 0 — reporting cfg.batchSize here would read on the
+		// dashboard as Sentry dropping a full batch it never received.
+		return batchResult{}
+	}
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		return sendTraceTagged(client, batchID, seq, 4)
+	}
+	query := func(ctx context.Context) (map[string]bool, error) {
+		return s.findBatch("transactions", batchID, "trace", cfg.batchSize)
+	}
+	return runBatch(ctx, batchConfigFrom(cfg), send, query)
 }

@@ -124,6 +124,20 @@ type batchConfig struct {
 	sendWorkers  int
 }
 
+// batchConfigFrom derives the batch engine's settings from the process config.
+// sendWorkers is fixed: the pacing schedule, not concurrency, sets the send
+// rate; the pool only absorbs the tail of slow sends so one lagging flush does
+// not push later sends outside the window.
+func batchConfigFrom(cfg config) batchConfig {
+	return batchConfig{
+		size:         cfg.batchSize,
+		sendWindow:   cfg.sendWindow,
+		pollTimeout:  cfg.pollTimeout,
+		pollInterval: cfg.pollInterval,
+		sendWorkers:  8,
+	}
+}
+
 // runBatch paces cfg.size sends across cfg.sendWindow while polling query every
 // cfg.pollInterval, recording per-event latency, until all are received or the
 // drain deadline passes.
