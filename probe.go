@@ -30,40 +30,6 @@ func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
 	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project, baseURL: "https://sentry.io"}
 }
 
-func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Time, err error) {
-	client, clientErr := sentry.NewClient(sentry.ClientOptions{
-		Dsn:              s.dsn,
-		EnableTracing:    true, // required in sentry-go v0.x; without it transactions are dropped (SampledFalse)
-		TracesSampleRate: 1.0,
-		Environment:      "probe",
-		Release:          "sentry-slo-probe@1.0.0",
-	})
-	if clientErr != nil {
-		return "", time.Time{}, fmt.Errorf("sentry client: %w", clientErr)
-	}
-
-	hub := sentry.NewHub(client, sentry.NewScope())
-	ctx := sentry.SetHubOnContext(context.Background(), hub)
-
-	span := sentry.StartTransaction(ctx, "probe.login",
-		sentry.WithOpName("slo.probe"),
-		sentry.WithDescription("Synthetic login probe for SLO measurement"),
-	)
-	for i := 0; i < n; i++ {
-		child := span.StartChild(fmt.Sprintf("probe.span.%d", i),
-			sentry.WithDescription(fmt.Sprintf("Probe child span %d", i)),
-		)
-		sleep(5, 20)
-		child.Status = sentry.SpanStatusOK
-		child.Finish()
-	}
-	span.Finish()
-	traceID = span.TraceID.String()
-	sentAt = time.Now()
-	client.Flush(10 * time.Second)
-	return traceID, sentAt, nil
-}
-
 func (s *sentryProbe) sendError() (probeID string, sentAt time.Time, err error) {
 	client, clientErr := sentry.NewClient(sentry.ClientOptions{
 		Dsn:         s.dsn,
@@ -160,7 +126,8 @@ func sendTraceTagged(client *sentry.Client, batchKey string, seq, n int) (string
 	}
 	span.Finish()
 	traceID := span.TraceID.String()
-	// Stamp before the flush, like sendTraceWithSpans: PROBE_BATCH_SIZE=1 must
+	// Stamp before the flush, as the retired single-event sender did:
+	// PROBE_BATCH_SIZE=1 must
 	// reproduce single-event behaviour, and a post-flush stamp would report a
 	// systematically smaller latency for the identical event. Flush also drains
 	// the whole shared client buffer, so a worker whose own event left at t=0
