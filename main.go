@@ -32,58 +32,140 @@ func main() {
 		fmt.Sprintf("sentry_project:%s", cfg.sentryProject),
 	}
 
-	log.Printf("Starting SLO probes (interval=%s)", cfg.interval)
+	log.Printf("Starting SLO probes (interval=%s, batch=%d, send_window=%s, poll_timeout=%s, max_inflight=%d)",
+		cfg.interval, cfg.batchSize, cfg.sendWindow, cfg.pollTimeout, maxInflightBatches)
 
 	var wg sync.WaitGroup
 	wg.Add(3)
 
-	// Probe 1: trace ingestion latency
-	go runProbeLoop("trace_ingestion", cfg.interval, &wg, func(ctx context.Context) {
-		result, err := probe(ctx, s, cfg.pollTimeout, cfg.pollInterval)
-		if err != nil {
-			log.Printf("[trace_ingestion] ERROR: %v", err)
-			dd.postMetric("sentry.ingestion.error", 1, append(baseTags, "probe:trace_ingestion"))
-			return
-		}
-		log.Printf("[trace_ingestion] latency=%s", result.latency)
-		dd.postMetric("sentry.ingestion.latency_ms", float64(result.latency.Milliseconds()), append(baseTags, "probe:trace_ingestion"))
+	// Each probe signal gets its own cap: one signal backing up behind a slow
+	// Sentry must not stop the others from firing.
+
+	// Probe 1: trace ingestion latency + reliability.
+	go runBatchLoop("trace_ingestion", cfg, newInflightCap(maxInflightBatches), &wg, func(id string) {
+		res := probeBatch(ctx, s, cfg, id)
+		log.Printf("[trace_ingestion] batch=%s received=%d/%d p50=%s p95=%s",
+			id, res.received, res.sent, percentile(res.latencies, 50), percentile(res.latencies, 95))
+		// "ingestion", not "trace_ingestion": keeps the metric namespace
+		// (sentry.ingestion.*) the dashboards already read.
+		// postBatchMetrics copies baseTags before appending its probe tag.
+		dd.postBatchMetrics("ingestion", res, baseTags)
 	})
 
-	// Probe 2: error ingestion latency
-	go runProbeLoop("error_ingestion", cfg.interval, &wg, func(ctx context.Context) {
-		result, err := probeError(ctx, s, cfg.pollTimeout, cfg.pollInterval)
-		if err != nil {
-			log.Printf("[error_ingestion] ERROR: %v", err)
-			dd.postMetric("sentry.ingestion.error", 1, append(baseTags, "probe:error_ingestion"))
-			return
-		}
-		log.Printf("[error_ingestion] latency=%s", result.latency)
-		dd.postMetric("sentry.error_ingestion.latency_ms", float64(result.latency.Milliseconds()), append(baseTags, "probe:error_ingestion"))
+	// Probe 2: error ingestion latency + reliability.
+	go runBatchLoop("error_ingestion", cfg, newInflightCap(maxInflightBatches), &wg, func(id string) {
+		res := probeErrorBatch(ctx, s, cfg, id)
+		log.Printf("[error_ingestion] batch=%s received=%d/%d p50=%s p95=%s",
+			id, res.received, res.sent, percentile(res.latencies, 50), percentile(res.latencies, 95))
+		dd.postBatchMetrics("error_ingestion", res, baseTags)
 	})
 
-	// Probe 3: span completeness
-	go runProbeLoop("span_completeness", cfg.interval, &wg, func(ctx context.Context) {
-		result, err := probeSpans(ctx, s, cfg.pollTimeout, cfg.pollInterval)
-		if err != nil {
-			log.Printf("[span_completeness] ERROR: %v", err)
-			dd.postMetric("sentry.ingestion.error", 1, append(baseTags, "probe:span_completeness"))
+	// Probe 3: span completeness (ingestion of the batch, plus sampled
+	// completeness over the transactions that arrived).
+	go runBatchLoop("span_completeness", cfg, newInflightCap(maxInflightBatches), &wg, func(id string) {
+		res, pct, known := probeSpansBatch(ctx, s, cfg, id)
+		pctText := "unknown"
+		if known {
+			pctText = fmt.Sprintf("%.0f%%", pct)
+		}
+		log.Printf("[span_completeness] batch=%s received=%d/%d received_pct=%s",
+			id, res.received, res.sent, pctText)
+		dd.postBatchMetrics("span_completeness", res, baseTags)
+		if !known {
+			// known=false means the completeness sample is missing, not that no
+			// spans arrived: either the event-id lookup failed or no sampled
+			// event returned a span count. Publishing 0 would manufacture a
+			// total-failure reading out of an API hiccup, so the metric is
+			// suppressed for this cycle and the gap stays visible as a gap.
+			log.Printf("[span_completeness] batch=%s: completeness not measured this cycle, suppressing sentry.span_completeness.received_pct", id)
 			return
 		}
-		log.Printf("[span_completeness] received=%d/%d (%.0f%%)", result.receivedSpans, result.sentSpans, result.pct)
-		dd.postMetric("sentry.span_completeness.received_pct", result.pct, append(baseTags, "probe:span_completeness"))
+		// Copy baseTags before appending. All three loops share one baseTags
+		// slice; appending in place would be a concurrent write to a shared
+		// backing array the moment baseTags has spare capacity, and would
+		// scribble one probe's tag into another's metrics.
+		dd.postMetricLogged("sentry.span_completeness.received_pct", pct,
+			append(append([]string{}, baseTags...), "probe:span_completeness"))
 	})
 
 	wg.Wait()
 }
 
-func runProbeLoop(name string, interval time.Duration, wg *sync.WaitGroup, fn func(context.Context)) {
+// maxInflightBatches bounds concurrent batches per probe signal.
+//
+// This is load-bearing, not decorative. At defaults one batch runs for up to
+// sendWindow (100s) + pollTimeout (120s) ~= 220s against an interval of 120s,
+// so consecutive batches overlap in normal healthy operation — two in flight is
+// the expected steady state, and the skip log below is a routine sight. The cap
+// exists so that a Sentry stall cannot grow the backlog without bound.
+const maxInflightBatches = 2
+
+// inflightCap bounds concurrent in-flight batches for one probe type.
+type inflightCap struct {
+	mu  sync.Mutex
+	n   int
+	max int // set once at construction; never written again, so safe to read unlocked
+}
+
+func newInflightCap(max int) *inflightCap { return &inflightCap{max: max} }
+
+// try reserves a slot, reporting whether one was free.
+func (c *inflightCap) try() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n >= c.max {
+		return false
+	}
+	c.n++
+	return true
+}
+
+// done releases a slot taken by try. The floor at zero keeps a stray release
+// from widening the cap rather than being a no-op.
+func (c *inflightCap) done() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n > 0 {
+		c.n--
+	}
+}
+
+// batchID builds a unique, deterministic batch identifier (no wall clock so it
+// stays testable): probe signal + cycle counter. The trace probes namespace it
+// further per Sentry signal (batchKeyFor) before tagging events.
+func batchID(signal string, n int) string {
+	return fmt.Sprintf("%s-%d", signal, n)
+}
+
+// runBatchLoop fires a batch immediately and then every cfg.interval, capping
+// how many batches of this signal may be in flight at once. Each batch runs in
+// its own goroutine because a batch routinely outlives the interval; the loop
+// must keep ticking rather than block on the previous cycle.
+func runBatchLoop(name string, cfg config, limiter *inflightCap, wg *sync.WaitGroup, run func(id string)) {
 	defer wg.Done()
-	log.Printf("[%s] starting (interval=%s)", name, interval)
-	fn(context.Background())
-	ticker := time.NewTicker(interval)
+	log.Printf("[%s] starting (interval=%s, batch=%d)", name, cfg.interval, cfg.batchSize)
+	cycle := 0
+	fire := func() {
+		// Incremented before the cap check so a skipped cycle still consumes its
+		// number: batch ids stay unique, and the gaps in the sequence show up in
+		// the logs as the skips they were.
+		cycle++
+		id := batchID(name, cycle)
+		if !limiter.try() {
+			log.Printf("[%s] skipping cycle %d (batch=%s): %d batches still draining, at in-flight cap — expected at defaults, where a batch can outlast the %s interval",
+				name, cycle, id, limiter.max, cfg.interval)
+			return
+		}
+		go func() {
+			defer limiter.done()
+			run(id)
+		}()
+	}
+	fire()
+	ticker := time.NewTicker(cfg.interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		fn(context.Background())
+		fire()
 	}
 }
 

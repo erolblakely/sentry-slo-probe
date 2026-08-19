@@ -2,55 +2,20 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"time"
 
 	"github.com/getsentry/sentry-go"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 )
 
+// probeResult is the outcome of a single-event probe. Still used by probeAlert,
+// which measures alert-rule firing latency from one error event rather than a
+// batch.
 type probeResult struct {
 	traceID string
 	latency time.Duration
-}
-
-// probe measures Sentry trace ingestion latency.
-func probe(ctx context.Context, s *sentryProbe, timeout, pollInterval time.Duration) (*probeResult, error) {
-	ctx, span := tracer.Start(ctx, "probe.trace_ingestion")
-	defer span.End()
-
-	var sentAt time.Time
-	traceID, err := timedSpan(ctx, "sentry.send_trace", func() (string, error) {
-		var id string
-		var err error
-		id, sentAt, err = s.sendTrace()
-		return id, err
-	})
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, fmt.Errorf("send trace: %w", err)
-	}
-	span.SetAttributes(attribute.String("sentry.trace_id", traceID))
-
-	attempts, err := pollWithSpan(ctx, "sentry.await_ingestion", timeout, pollInterval, func() (bool, error) {
-		return s.traceExists(traceID)
-	})
-	span.SetAttributes(attribute.Int("sentry.poll_attempts", attempts))
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, fmt.Errorf("trace %s: %w", traceID, err)
-	}
-
-	latency := time.Since(sentAt)
-	span.SetAttributes(attribute.Int64("sentry.ingestion_latency_ms", latency.Milliseconds()))
-	span.SetStatus(codes.Ok, "")
-	return &probeResult{traceID: traceID, latency: latency}, nil
 }
 
 type sentryProbe struct {
@@ -63,10 +28,6 @@ type sentryProbe struct {
 
 func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
 	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project, baseURL: "https://sentry.io"}
-}
-
-func (s *sentryProbe) sendTrace() (traceID string, sentAt time.Time, err error) {
-	return s.sendTraceWithSpans(4)
 }
 
 func (s *sentryProbe) sendTraceWithSpans(n int) (traceID string, sentAt time.Time, err error) {
@@ -120,70 +81,6 @@ func (s *sentryProbe) sendError() (probeID string, sentAt time.Time, err error) 
 	sentAt = time.Now()
 	client.Flush(10 * time.Second)
 	return probeID, sentAt, nil
-}
-
-// pollUntil retries checkFn every pollInterval until it returns true or the
-// context deadline is exceeded. Returns the number of attempts made.
-func pollUntil(ctx context.Context, timeout, pollInterval time.Duration, checkFn func() (bool, error)) (int, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	attempts := 0
-	var lastErr error
-	for {
-		select {
-		case <-ctx.Done():
-			if lastErr != nil {
-				return attempts, fmt.Errorf("timed out after %s (%d attempts); last error: %w", timeout, attempts, lastErr)
-			}
-			return attempts, fmt.Errorf("timed out after %s (%d attempts)", timeout, attempts)
-		case <-time.After(pollInterval):
-			attempts++
-			found, err := checkFn()
-			if err != nil {
-				lastErr = err
-				// A permanent client error (bad auth, missing scope, bad
-				// request) will never succeed — stop instead of polling to
-				// the deadline and hiding it behind a timeout.
-				var apiErr *apiError
-				if errors.As(err, &apiErr) && apiErr.permanent() {
-					return attempts, fmt.Errorf("permanent error after %d attempts: %w", attempts, err)
-				}
-				continue
-			}
-			if found {
-				return attempts, nil
-			}
-		}
-	}
-}
-
-// pollWithSpan wraps pollUntil in an OTel span.
-func pollWithSpan(ctx context.Context, spanName string, timeout, pollInterval time.Duration, checkFn func() (bool, error)) (int, error) {
-	ctx, span := tracer.Start(ctx, spanName)
-	defer span.End()
-	attempts, err := pollUntil(ctx, timeout, pollInterval, checkFn)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	} else {
-		span.SetStatus(codes.Ok, "")
-	}
-	return attempts, err
-}
-
-// timedSpan runs fn inside a new child span, returning its result.
-func timedSpan(ctx context.Context, spanName string, fn func() (string, error)) (string, error) {
-	_, span := tracer.Start(ctx, spanName)
-	defer span.End()
-	result, err := fn()
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-	} else {
-		span.SetStatus(codes.Ok, "")
-	}
-	return result, err
 }
 
 // newTracingClient builds a client for transaction probes. EnableTracing is
