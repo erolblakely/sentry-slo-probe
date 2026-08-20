@@ -1,6 +1,8 @@
 package main
 
 import (
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -25,40 +27,65 @@ func TestInflightCap(t *testing.T) {
 // for. try() and done() are called from the loop goroutine and the batch
 // goroutines respectively, so a missing lock is a real data race; TestInflightCap
 // alone would pass without one. Run under -race this fails on an unguarded
-// counter, and the peak assertion fails on a lost update.
+// counter, and the peak assertion fails if the cap ever hands out an extra slot.
+//
+// Holders keep their slot until the test releases them. That barrier is what
+// makes the peak assertion mean anything: incrementing and decrementing
+// back-to-back left peak reading 1 on almost every run, so the assertion could
+// not fail even with the cap removed entirely. With the barrier, exactly max
+// try() calls can succeed and all of them are live at once when peak is read, so
+// peak is deterministically max — and any widening of the cap shows up.
 func TestInflightCapConcurrent(t *testing.T) {
 	const max = 2
+	const goroutines = 100
 	c := newInflightCap(max)
 
 	var mu sync.Mutex
 	live, peak := 0, 0
 
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
+	release := make(chan struct{})
+	// attempted counts every goroutine that has finished its try() *and* recorded
+	// the result, so once it drains, live/peak are settled with the holders still
+	// holding. No sleeps, so the assertion is deterministic rather than timing-dependent.
+	var attempted, wg sync.WaitGroup
+	attempted.Add(goroutines)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			if !c.try() {
+			ok := c.try()
+			if ok {
+				mu.Lock()
+				live++
+				if live > peak {
+					peak = live
+				}
+				mu.Unlock()
+			}
+			attempted.Done()
+			if !ok {
 				return
 			}
-			mu.Lock()
-			live++
-			if live > peak {
-				peak = live
-			}
-			mu.Unlock()
-
+			<-release // hold the slot across the barrier
 			mu.Lock()
 			live--
 			mu.Unlock()
 			c.done()
 		}()
 	}
+
+	attempted.Wait()
+	mu.Lock()
+	gotPeak := peak
+	mu.Unlock()
+	if gotPeak != max {
+		t.Errorf("peak concurrent holders = %d, want exactly %d (cap %d, %d contenders, none released yet)",
+			gotPeak, max, max, goroutines)
+	}
+
+	close(release)
 	wg.Wait()
 
-	if peak > max {
-		t.Errorf("peak concurrent holders = %d, want <= %d", peak, max)
-	}
 	// Every holder released, so the cap must be fully available again.
 	for i := 0; i < max; i++ {
 		if !c.try() {
@@ -82,6 +109,85 @@ func TestInflightCapDoneWithoutTry(t *testing.T) {
 	if c.try() {
 		t.Fatal("second acquisition should fail at cap 1: stray done() calls widened the cap")
 	}
+}
+
+// spanBatchMetrics is the set postBatchMetrics emits for the span_completeness
+// signal — everything reportSpanCompleteness publishes *except* received_pct,
+// which is the one metric under test.
+var spanBatchMetrics = []string{
+	"sentry.span_completeness.latency_ms.p50",
+	"sentry.span_completeness.latency_ms.p95",
+	"sentry.span_completeness.latency_ms.p99",
+	"sentry.span_completeness.received",
+	"sentry.span_completeness.sent",
+	"sentry.span_completeness.success_rate",
+}
+
+// TestReportSpanCompleteness pins the suppression rule: when the completeness
+// sample is unknown, received_pct must not be published at all. Publishing 0
+// instead would turn an API hiccup into a fabricated total-span-loss reading —
+// the SLO would show a breach that never happened. This lived in an anonymous
+// closure in main and so had no automated protection; the function exists to be
+// testable, and this is the test.
+func TestReportSpanCompleteness(t *testing.T) {
+	res := batchResult{sent: 10, received: 10, latencies: []time.Duration{time.Second}}
+	wantTags := []string{"probe:span_completeness", "sentry_org:o", "sentry_project:p"}
+
+	t.Run("unknown completeness suppresses received_pct", func(t *testing.T) {
+		d, rec := newTestDatadogClient(t)
+
+		// pct is deliberately a value that would look catastrophic if published.
+		reportSpanCompleteness(d, "run-span_completeness-1", res, 0, false, []string{"sentry_org:o", "sentry_project:p"})
+
+		series := rec.captured(t)
+		for _, s := range series {
+			if s.Metric == "sentry.span_completeness.received_pct" {
+				t.Fatalf("received_pct was published with value %v while the sample was unknown: a fabricated reading, not a measurement", s.Points)
+			}
+		}
+		// The ingestion side of the probe is still measured, so the batch metrics
+		// must all arrive — suppression is scoped to the one unknown metric.
+		if got := metricNames(series); !slices.Equal(got, spanBatchMetrics) {
+			t.Errorf("metric names\n got: %v\nwant: %v", got, spanBatchMetrics)
+		}
+	})
+
+	t.Run("known completeness publishes received_pct", func(t *testing.T) {
+		d, rec := newTestDatadogClient(t)
+
+		reportSpanCompleteness(d, "run-span_completeness-1", res, 80, true, []string{"sentry_org:o", "sentry_project:p"})
+
+		series := rec.captured(t)
+		want := append(slices.Clone(spanBatchMetrics), "sentry.span_completeness.received_pct")
+		sort.Strings(want)
+		if got := metricNames(series); !slices.Equal(got, want) {
+			t.Errorf("metric names\n got: %v\nwant: %v", got, want)
+		}
+		if got := metricValue(t, series, "sentry.span_completeness.received_pct"); got != 80 {
+			t.Errorf("received_pct = %v, want 80", got)
+		}
+		// Every series, received_pct included, carries the org/project tags plus
+		// the probe tag — a mistagged metric is invisible to the monitor scope.
+		assertTags(t, series, wantTags)
+	})
+
+	t.Run("does not append into caller's tags", func(t *testing.T) {
+		d, rec := newTestDatadogClient(t)
+
+		// The received_pct call site appends its probe tag by hand, so it is the
+		// one place in the reporting path that can scribble into the baseTags
+		// slice all three probe loops share. A len==cap literal would hide the
+		// bug, so hand over a slice with spare capacity and watch the spare slot.
+		backing := []string{"sentry_org:o", "sentry_project:p", "unwritten"}
+		baseTags := backing[:2]
+
+		reportSpanCompleteness(d, "run-span_completeness-1", res, 80, true, baseTags)
+
+		if backing[2] != "unwritten" {
+			t.Errorf("reportSpanCompleteness wrote %q into the caller's backing array; baseTags is shared across all three probe loops", backing[2])
+		}
+		assertTags(t, rec.captured(t), wantTags)
+	})
 }
 
 func TestMakeBatchID(t *testing.T) {
@@ -173,8 +279,10 @@ func TestNewRunID(t *testing.T) {
 	}
 
 	// Later starts sort after earlier ones, so ids order by run in a log or a
-	// Sentry tag list. Base36 of a nanosecond count keeps a fixed width for
-	// centuries, so lexicographic order tracks time order.
+	// Sentry tag list. Base36 of a nanosecond count is a fixed 12 characters for
+	// the rest of this century, so lexicographic order tracks time order — until
+	// the count gains a 13th character around 2120. One century, not centuries;
+	// nothing depends on the ordering.
 	early, late := newRunID(base), newRunID(base.Add(time.Hour))
 	if !(early < late) {
 		t.Errorf("run ids not monotonic: %q (earlier) is not < %q (later)", early, late)

@@ -60,8 +60,14 @@ func main() {
 		res := probeBatch(ctx, s, cfg, id)
 		log.Printf("[trace_ingestion] batch=%s received=%d/%d p50=%s p95=%s",
 			id, res.received, res.sent, percentile(res.latencies, 50), percentile(res.latencies, 95))
-		// "ingestion", not "trace_ingestion": keeps the metric namespace
-		// (sentry.ingestion.*) the dashboards already read.
+		// The signal name is "ingestion", not "trace_ingestion". That choice
+		// preserves the metric *prefix* sentry.ingestion.* — and nothing more. No
+		// pre-batch dashboard query survives it: latency_ms became
+		// latency_ms.p50/.p95/.p99, sent/received/success_rate are new, and
+		// sentry.ingestion.error was retired with no successor, and Datadog does
+		// not match a query on a parent name against sentry.ingestion.latency_ms.p95.
+		// Every consumer had to be rewritten; see README "Metrics emitted" and
+		// scripts/setup_datadog_slos.sh, which were.
 		// postBatchMetrics copies baseTags before appending its probe tag.
 		dd.postBatchMetrics("ingestion", res, baseTags)
 	})
@@ -78,40 +84,61 @@ func main() {
 	// completeness over the transactions that arrived).
 	go runBatchLoop("span_completeness", cfg, runID, newInflightCap(maxInflightBatches), &wg, func(id string) {
 		res, pct, known := probeSpansBatch(ctx, s, cfg, id)
-		pctText := "unknown"
-		if known {
-			pctText = fmt.Sprintf("%.0f%%", pct)
-		}
-		log.Printf("[span_completeness] batch=%s received=%d/%d received_pct=%s",
-			id, res.received, res.sent, pctText)
-		dd.postBatchMetrics("span_completeness", res, baseTags)
-		if !known {
-			// known=false means the completeness sample is missing, not that no
-			// spans arrived: either the event-id lookup failed or no sampled
-			// event returned a span count. Publishing 0 would manufacture a
-			// total-failure reading out of an API hiccup, so the metric is
-			// suppressed for this cycle and the gap stays visible as a gap.
-			log.Printf("[span_completeness] batch=%s: completeness not measured this cycle, suppressing sentry.span_completeness.received_pct", id)
-			return
-		}
-		// Copy baseTags before appending. All three loops share one baseTags
-		// slice; appending in place would be a concurrent write to a shared
-		// backing array the moment baseTags has spare capacity, and would
-		// scribble one probe's tag into another's metrics.
-		dd.postMetricLogged("sentry.span_completeness.received_pct", pct,
-			append(append([]string{}, baseTags...), "probe:span_completeness"))
+		reportSpanCompleteness(dd, id, res, pct, known, baseTags)
 	})
 
 	wg.Wait()
 }
 
+// reportSpanCompleteness logs one span-completeness cycle and publishes its
+// metrics, suppressing sentry.span_completeness.received_pct when the sample is
+// unknown.
+//
+// A named function rather than a closure inside main because the suppression
+// rule below is the most consequential decision in the batch reporting path,
+// and a closure in main cannot be reached by a test. Pinned by
+// TestReportSpanCompleteness.
+func reportSpanCompleteness(dd *datadogClient, id string, res batchResult, pct float64, known bool, baseTags []string) {
+	pctText := "unknown"
+	if known {
+		pctText = fmt.Sprintf("%.0f%%", pct)
+	}
+	log.Printf("[span_completeness] batch=%s received=%d/%d received_pct=%s",
+		id, res.received, res.sent, pctText)
+	// postBatchMetrics copies baseTags before appending its probe tag. It runs
+	// either way: the ingestion side of this probe is measured even when the
+	// completeness sample is not.
+	dd.postBatchMetrics("span_completeness", res, baseTags)
+	if !known {
+		// known=false means the completeness sample is missing, not that no
+		// spans arrived: either the event-id lookup failed or no sampled event
+		// returned a span count. Publishing 0 would manufacture a total-failure
+		// reading out of an API hiccup, so the metric is suppressed for this
+		// cycle and the gap stays visible as a gap.
+		log.Printf("[span_completeness] batch=%s: completeness not measured this cycle, suppressing sentry.span_completeness.received_pct", id)
+		return
+	}
+	// Copy baseTags before appending. All three loops share one baseTags slice;
+	// appending in place would be a concurrent write to a shared backing array
+	// the moment baseTags has spare capacity, and would scribble one probe's tag
+	// into another's metrics.
+	dd.postMetricLogged("sentry.span_completeness.received_pct", pct,
+		append(append([]string{}, baseTags...), "probe:span_completeness"))
+}
+
 // maxInflightBatches bounds concurrent batches per probe signal.
 //
-// This is load-bearing, not decorative. At defaults one batch runs for up to
-// sendWindow (100s) + pollTimeout (120s) ~= 220s against an interval of 120s,
-// so consecutive batches overlap in normal healthy operation — two in flight is
-// the expected steady state, and the skip log below is a routine sight. The cap
-// exists so that a Sentry stall cannot grow the backlog without bound.
+// This is load-bearing, not decorative. At defaults one batch is bounded at
+// sendWindow (100s) + pollTimeout (120s) + pollInterval (5s) = 225s against an
+// interval of 120s, so consecutive batches overlap in normal healthy operation:
+// two in flight is the expected steady state.
+//
+// A *skip* is a different thing, and is not routine. Skipping needs two batches
+// still alive at one tick, which means a batch that has outlived 2 x interval =
+// 240s — 15s past the engine's own 225s ceiling, reachable only when <-sendDone
+// blocks on a slow flush. So overlap is expected; the skip log below is the
+// first sign the send path is dragging. The cap exists so that a Sentry stall
+// cannot grow the backlog without bound.
 const maxInflightBatches = 2
 
 // inflightCap bounds concurrent in-flight batches for one probe type.
@@ -173,11 +200,15 @@ func qualifyBatchID(runID, signal string, n int) string {
 // argument so it stays a pure function of its input, and is called exactly once
 // (in main) so every batch id from one process shares a run.
 //
-// Base36 nanoseconds: short, lexicographically ordered by start time, and
-// [0-9a-z] only, so it never collides with the "-" that joins the id's parts.
-// Nanoseconds rather than seconds because the whole point is surviving a
-// restart, and a container relaunched inside the same second must still get a
-// fresh id.
+// Base36 nanoseconds: short, and [0-9a-z] only, so it never collides with the
+// "-" that joins the id's parts. Nanoseconds rather than seconds because the
+// whole point is surviving a restart, and a container relaunched inside the same
+// second must still get a fresh id.
+//
+// Ids are 12 characters and so sort lexicographically by start time for the rest
+// of this century; the nanosecond count gains a 13th character around 2120,
+// after which newer ids sort before older ones. One century, not centuries —
+// nothing depends on the ordering, it is only a convenience when scanning logs.
 func newRunID(now time.Time) string {
 	return strconv.FormatInt(now.UTC().UnixNano(), 36)
 }
@@ -186,6 +217,17 @@ func newRunID(now time.Time) string {
 // how many batches of this signal may be in flight at once. Each batch runs in
 // its own goroutine because a batch routinely outlives the interval; the loop
 // must keep ticking rather than block on the previous cycle.
+//
+// UNTESTED PROCESS GLUE — marked as such deliberately, per the plan's TDD rule.
+// `for range ticker.C` has no termination path, so the loop cannot be driven to
+// completion from a test without adding a stop channel, which would be a
+// behaviour change. It is verified only by the live end-to-end run. What no
+// automated test therefore covers: that a skipped cycle does not invoke `run`;
+// that `cycle` increments even on a skip (so ids stay unique and the gap in the
+// sequence records the skip); that the id handed to `run` is the run-qualified
+// one, not the bare per-cycle id; and that the first fire precedes the ticker's
+// first tick. The parts it composes — inflightCap, qualifyBatchID, newRunID —
+// are each unit tested on their own.
 func runBatchLoop(name string, cfg config, runID string, limiter *inflightCap, wg *sync.WaitGroup, run func(id string)) {
 	defer wg.Done()
 	log.Printf("[%s] starting (interval=%s, batch=%d)", name, cfg.interval, cfg.batchSize)
@@ -197,8 +239,11 @@ func runBatchLoop(name string, cfg config, runID string, limiter *inflightCap, w
 		cycle++
 		id := qualifyBatchID(runID, name, cycle)
 		if !limiter.try() {
-			log.Printf("[%s] skipping cycle %d (batch=%s): %d batches still draining, at in-flight cap — expected at defaults, where a batch can outlast the %s interval",
-				name, cycle, id, limiter.max, cfg.interval)
+			// Two batches overlapping is normal (see maxInflightBatches); a skip
+			// is not. It means a batch has outlived 2x the interval, which is past
+			// the send+poll ceiling, so say that rather than calling it expected.
+			log.Printf("[%s] skipping cycle %d (batch=%s): %d batches still draining, at in-flight cap — a batch has outlived %s (2x the %s interval), past the send+poll ceiling: the send path is dragging",
+				name, cycle, id, limiter.max, 2*cfg.interval, cfg.interval)
 			return
 		}
 		go func() {

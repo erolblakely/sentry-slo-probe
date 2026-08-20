@@ -22,32 +22,6 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("sentry api %d: %s", e.StatusCode, e.Body)
 }
 
-func (s *sentryProbe) findTrace(traceID string) (bool, string, error) {
-	q := url.Values{}
-	q.Set("dataset", "transactions")
-	q.Set("query", fmt.Sprintf("trace:%s", traceID))
-	q.Set("field", "id")
-	q.Set("field", "trace")
-	q.Set("per_page", "1")
-
-	endpoint := fmt.Sprintf("%s/api/0/organizations/%s/events/?%s",
-		s.baseURL, url.PathEscape(s.org), q.Encode())
-
-	var result struct {
-		Data []struct {
-			ID    string `json:"id"`
-			Trace string `json:"trace"`
-		} `json:"data"`
-	}
-	if err := s.get(endpoint, &result); err != nil {
-		return false, "", err
-	}
-	if len(result.Data) == 0 {
-		return false, "", nil
-	}
-	return true, result.Data[0].ID, nil
-}
-
 // fetchEventSpanCount fetches a transaction event and returns the number of child spans.
 func (s *sentryProbe) fetchEventSpanCount(eventID string) (int, error) {
 	endpoint := fmt.Sprintf("%s/api/0/projects/%s/%s/events/%s/",

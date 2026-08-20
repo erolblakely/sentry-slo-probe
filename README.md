@@ -8,16 +8,16 @@ Your error tracker is the thing you find out about outages from. This measures w
 
 | Probe | Question it answers | How |
 |---|---|---|
-| **Trace ingestion** | How long until a transaction is queryable? | Sends a probe transaction, polls Discover for its trace ID |
-| **Error ingestion** | How long until an error is queryable? | Sends a probe error, polls the project's issues for it |
-| **Span completeness** | Do all the spans actually arrive? | Sends a transaction with 5 child spans, then counts the spans Sentry stored |
+| **Trace ingestion** | How long until a transaction is queryable, and how many never are? | Sends a batch of probe transactions tagged with a batch id, polls Discover for that tag |
+| **Error ingestion** | How long until an error is queryable, and how many never are? | Sends a batch of probe errors, polls Discover for the batch tag |
+| **Span completeness** | Do all the spans actually arrive? | Sends transactions with 5 child spans each, then counts the spans Sentry stored on a sample of the ones that arrived |
 
 Span completeness is the one that catches quiet data loss. A trace can arrive while some of its spans are silently dropped, so ingestion latency alone looks healthy.
 
 ## How it works
 
 ```
-   send synthetic event          poll Sentry API until it appears         emit
+   send synthetic batch          poll Sentry API until they appear        emit
   ┌──────────────────┐          ┌─────────────────────────────┐    ┌──────────────┐
   │  Sentry SDK      │─────────▶│  GET /api/0/.../events/     │───▶│   Datadog    │
   │  (real ingest)   │          │  every POLL_INTERVAL         │    │  v2/series   │
@@ -27,18 +27,32 @@ Span completeness is the one that catches quiet data loss. A trace can arrive wh
 
 Latency is wall-clock from send to the first successful query, so its **resolution is bounded by `POLL_INTERVAL_SECONDS`** (5s by default) — a 1-second ingestion and a 4-second ingestion may both report as one poll.
 
-Each probe run is also traced with OpenTelemetry and exported straight to Datadog's agentless OTLP intake (`otlp.<DD_SITE>`), so you can see the probe's own send/poll breakdown in APM without running an agent.
+An OpenTelemetry exporter to Datadog's agentless OTLP intake (`otlp.<DD_SITE>`) is still configured, but **it currently emits no spans**. The single-event probes were the only things that created them, and the batch probes that replaced them are not self-instrumented — so there is nothing to see in APM. Its failure to initialise is logged and non-fatal.
 
 ## Metrics emitted
 
+Each cycle sends a batch of `PROBE_BATCH_SIZE` events per probe, so every signal reports a distribution and a success rate rather than one sample. For each signal in `ingestion` (traces), `error_ingestion`, and `span_completeness`:
+
 | Metric | Unit | Meaning |
 |---|---|---|
-| `sentry.ingestion.latency_ms` | ms | Transaction ingestion latency |
-| `sentry.error_ingestion.latency_ms` | ms | Error ingestion latency |
-| `sentry.span_completeness.received_pct` | % | Spans stored ÷ spans sent |
-| `sentry.ingestion.error` | count | Posted as `1` whenever a probe fails outright |
+| `sentry.<signal>.latency_ms.p50` | ms | Median send→queryable latency over the batch |
+| `sentry.<signal>.latency_ms.p95` | ms | p95 — the series the monitors alert on |
+| `sentry.<signal>.latency_ms.p99` | ms | p99 (a single event, at a batch size of 100) |
+| `sentry.<signal>.sent` | count | Events that left the process successfully |
+| `sentry.<signal>.received` | count | Events that came back queryable before the poll timeout |
+| `sentry.<signal>.success_rate` | % | `received / sent`, published as `0` when `sent` is `0` |
 
-All tagged `sentry_org:<org>`, `sentry_project:<project>`, and `probe:<name>`.
+Plus one metric from the span probe alone:
+
+| Metric | Unit | Meaning |
+|---|---|---|
+| `sentry.span_completeness.received_pct` | % | Spans stored ÷ spans sent, sampled over the transactions that arrived. **Not published at all** when the sample could not be taken — a gap in the series, rather than a fabricated `0%` that would read as total span loss. |
+
+The trace signal is called `ingestion`, not `trace_ingestion`, so its metrics live under `sentry.ingestion.*` and its tag is `probe:ingestion`. All metrics are tagged `sentry_org:<org>`, `sentry_project:<project>`, and `probe:<signal>`.
+
+**There is no `sentry.ingestion.error` metric.** The old per-cycle failure counter was retired along with the single-event probe, and has no successor. Failures surface in two other places: `sentry.<signal>.sent` short of `PROBE_BATCH_SIZE` means *our* send path failed, and a low `sentry.<signal>.success_rate` means Sentry did not return what we did send. Keeping those apart matters — a monitor on `success_rate` alone reports our own send outage as a Sentry breach, which is why `scripts/setup_datadog_slos.sh` gates each one behind `sent > 0`.
+
+If you are upgrading from the pre-batch metric names, note that Datadog does not roll a parent name up over its children: a query on `sentry.ingestion.latency_ms` does not match `sentry.ingestion.latency_ms.p95`. It goes permanently no-data instead of erroring, so nothing will tell you it broke.
 
 ## Quick start
 
@@ -56,13 +70,19 @@ Or with Docker:
 docker compose up --build
 ```
 
-You should see a line per probe per cycle:
+You should see a startup line, then a line per probe per cycle once its batch finishes draining:
 
 ```
-[trace_ingestion]   latency=3.1s
-[error_ingestion]   latency=8.4s
-[span_completeness] received=5/5 (100%)
+Starting SLO probes (run=3w5e11264sgsf, interval=2m0s, batch=100, send_window=1m40s, poll_timeout=2m0s, max_inflight=2)
+[trace_ingestion] starting (interval=2m0s, batch=100)
+[error_ingestion] starting (interval=2m0s, batch=100)
+[span_completeness] starting (interval=2m0s, batch=100)
+[trace_ingestion] batch=3w5e11264sgsf-trace_ingestion-1 received=100/100 p50=3.1s p95=6.4s
+[error_ingestion] batch=3w5e11264sgsf-error_ingestion-1 received=99/100 p50=8.4s p95=14.2s
+[span_completeness] batch=3w5e11264sgsf-span_completeness-1 received=100/100 received_pct=100%
 ```
+
+The `run=` component is regenerated on every start and prefixes every batch id, so a restart cannot re-query the previous process's events. `received_pct=unknown` means the completeness sample could not be taken this cycle; the metric is suppressed rather than reported as `0%`.
 
 ## Configuration
 
@@ -81,9 +101,14 @@ Optional:
 | Variable | Default | Purpose |
 |---|---|---|
 | `DD_SITE` | `datadoghq.com` | e.g. `datadoghq.eu`, `us3.datadoghq.com` |
-| `PROBE_INTERVAL_SECONDS` | `120` | How often each probe runs |
-| `POLL_TIMEOUT_SECONDS` | `120` | Give up waiting for an event after this long |
+| `PROBE_INTERVAL_SECONDS` | `120` | How often each probe starts a batch |
+| `POLL_TIMEOUT_SECONDS` | `120` | Give up waiting for the rest of a batch after this long |
 | `POLL_INTERVAL_SECONDS` | `5` | How often to poll — also the latency resolution |
+| `PROBE_BATCH_SIZE` | `100` | Events sent per probe per cycle |
+| `PROBE_SEND_WINDOW_SECONDS` | `100` | Batch sends are paced evenly across this window rather than fired at once |
+| `SPAN_COMPLETENESS_SAMPLE` | `20` | How many arrived transactions to fetch span counts for |
+
+A batch is bounded at `PROBE_SEND_WINDOW_SECONDS + POLL_TIMEOUT_SECONDS + POLL_INTERVAL_SECONDS` (225s at defaults), which is longer than the 120s interval, so two batches per probe overlap in normal operation. That is expected. A `skipping cycle` log line is not: it means a batch outlived twice the interval, which is past that ceiling, and points at a slow send path.
 
 Note that the probe writes real events into the target Sentry project and consumes quota. Point it at a dedicated project if that matters to you.
 
@@ -98,23 +123,25 @@ export DD_API_KEY=... DD_APP_KEY=... SENTRY_ORG=... SENTRY_PROJECT=...
 
 It is not idempotent — re-running creates duplicate monitors. The thresholds in it are starting points; tune them to your own ingestion behaviour once you have a few days of data.
 
+Each reliability SLO is backed by a **composite** of two monitors: `success_rate` below threshold, AND `sent > 0`. The gate is not optional — `success_rate` is published as `0` when nothing sent, so an ungated monitor turns a local send failure into a full SLO breach blamed on Sentry. The gate monitor sits in ALERT during normal operation by design; do not page on it, and do not fold the pair back into one monitor.
+
 ## Project status
 
-`main` runs the probes as described above: **one synthetic event per probe per cycle**.
+This branch (`batched-slo-probes`) sends a paced batch of events per probe per cycle, and the batch path **is** wired into `main.go` — the legacy single-event path has been deleted. That is what turns the latency signal into real p50/p95/p99 percentiles plus a success rate rather than a single sample, and it is why the metric names in this README differ from the ones the released code emits.
 
-Work is in progress on `batched-slo-probes` to send a paced batch of events per cycle instead, which turns the latency signal into real p50/p95/p99 percentiles plus a success rate rather than a single sample. The batch engine (`batch.go`) and its Sentry and Datadog support are built and tested on that branch, but are **not yet wired into `main.go`** — so nothing in the running behaviour has changed yet. The design and task plan live in `docs/`.
+The `main` branch still runs **one synthetic event per probe per cycle** and still emits the pre-batch metric names, so any dashboards built against it need updating before this branch merges. The design and task plan live in `docs/`.
 
 ## Layout
 
 ```
-main.go          config + the three probe loops
-probe.go         trace ingestion probe, Sentry send helpers, polling
-probe_error.go   error ingestion probe
-probe_spans.go   span completeness probe
-sentry_api.go    Sentry Discover / issues / event-detail queries
+main.go          config + the three batch probe loops
+probe.go         trace ingestion batch probe, Sentry send helpers
+probe_error.go   error ingestion batch probe
+probe_spans.go   span completeness batch probe
+sentry_api.go    Sentry Discover / event-detail queries
 datadog.go       Datadog v2 series submission
-tracer.go        OTel → Datadog agentless OTLP setup
-batch.go         batch engine (built, not yet wired in)
+tracer.go        OTel → Datadog agentless OTLP setup (configured, emits no spans)
+batch.go         batch engine: paced sends, batched polling, latency tracking
 scripts/         Datadog monitor + SLO provisioning
 docs/            design doc and implementation plan
 ```
@@ -127,4 +154,4 @@ go test ./... -race
 go vet ./...
 ```
 
-The pure logic — percentiles, send pacing, latency tracking, batch stop conditions, and the Sentry/Datadog request shapes — is unit tested against `httptest` servers. The probe functions themselves are network glue and are verified by running against live Sentry and Datadog.
+The pure logic — percentiles, send pacing, latency tracking, batch stop conditions, batch ids, the in-flight cap, the span-completeness suppression rule, and the Sentry/Datadog request shapes — is unit tested against `httptest` servers. The probe functions and `runBatchLoop` are network and process glue, marked as untested in the source, and verified by running against live Sentry and Datadog.
