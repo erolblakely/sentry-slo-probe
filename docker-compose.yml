@@ -10,8 +10,15 @@ services:
       # Datadog — receive SLO metrics
       DD_API_KEY: "${DD_API_KEY}"
       DD_SITE: "${DD_SITE:-datadoghq.com}"
-      # Probe tuning (optional)
-      PROBE_INTERVAL_SECONDS: "${PROBE_INTERVAL_SECONDS:-60}"
+      # Probe tuning (optional). These defaults must stay consistent with
+      # configFromEnv (main.go), .env.example, and the README Configuration
+      # table. PROBE_INTERVAL_SECONDS must not drop to 60: a batch's send+poll
+      # ceiling then exceeds 2x the interval every cycle and the probe logs
+      # "skipping cycle" as its steady state.
+      PROBE_INTERVAL_SECONDS: "${PROBE_INTERVAL_SECONDS:-120}"
       POLL_TIMEOUT_SECONDS: "${POLL_TIMEOUT_SECONDS:-120}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
+      PROBE_BATCH_SIZE: "${PROBE_BATCH_SIZE:-100}"
+      PROBE_SEND_WINDOW_SECONDS: "${PROBE_SEND_WINDOW_SECONDS:-100}"
+      SPAN_COMPLETENESS_SAMPLE: "${SPAN_COMPLETENESS_SAMPLE:-20}"
     restart: unless-stopped

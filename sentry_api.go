@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,93 +23,14 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("sentry api %d: %s", e.StatusCode, e.Body)
 }
 
-// permanent reports whether retrying is futile. 4xx client errors (auth,
-// permission, bad request) won't recover — except 429, which is a transient
-// rate-limit signal that we should keep retrying.
-func (e *apiError) permanent() bool {
-	return e.StatusCode >= 400 && e.StatusCode < 500 && e.StatusCode != http.StatusTooManyRequests
-}
-
-// traceExists checks whether a transaction with the given trace ID has been ingested.
-func (s *sentryProbe) traceExists(traceID string) (bool, error) {
-	_, eventID, err := s.findTrace(traceID)
-	return eventID != "", err
-}
-
-// traceExistsWithEventID returns true and the Sentry event ID once the trace is ingested.
-func (s *sentryProbe) traceExistsWithEventID(traceID string) (bool, string, error) {
-	return s.findTrace(traceID)
-}
-
-func (s *sentryProbe) findTrace(traceID string) (bool, string, error) {
-	q := url.Values{}
-	q.Set("dataset", "transactions")
-	q.Set("query", fmt.Sprintf("trace:%s", traceID))
-	q.Set("field", "id")
-	q.Set("field", "trace")
-	q.Set("per_page", "1")
-
-	endpoint := fmt.Sprintf("%s/api/0/organizations/%s/events/?%s",
-		s.baseURL, url.PathEscape(s.org), q.Encode())
-
-	var result struct {
-		Data []struct {
-			ID    string `json:"id"`
-			Trace string `json:"trace"`
-		} `json:"data"`
-	}
-	if err := s.get(endpoint, &result); err != nil {
-		return false, "", err
-	}
-	if len(result.Data) == 0 {
-		return false, "", nil
-	}
-	return true, result.Data[0].ID, nil
-}
-
-// errorExists polls the Sentry Issues API for an event with the given probe ID tag.
-func (s *sentryProbe) errorExists(probeID string) (bool, error) {
-	q := url.Values{}
-	q.Set("query", fmt.Sprintf("probe_id:%s", probeID))
-	q.Set("limit", "1")
-
-	endpoint := fmt.Sprintf("%s/api/0/projects/%s/%s/issues/?%s",
-		s.baseURL, url.PathEscape(s.org), url.PathEscape(s.project), q.Encode())
-
-	var result []json.RawMessage
-	if err := s.get(endpoint, &result); err != nil {
-		return false, err
-	}
-	return len(result) > 0, nil
-}
-
-// fetchEventSpanCount fetches a transaction event and returns the number of child spans.
-func (s *sentryProbe) fetchEventSpanCount(eventID string) (int, error) {
-	endpoint := fmt.Sprintf("%s/api/0/projects/%s/%s/events/%s/",
-		s.baseURL, url.PathEscape(s.org), url.PathEscape(s.project), url.PathEscape(eventID))
-
-	// A transaction event's child spans live under entries[type=="spans"].data,
-	// not a top-level "spans" field.
-	var event struct {
-		Entries []struct {
-			Type string          `json:"type"`
-			Data json.RawMessage `json:"data"`
-		} `json:"entries"`
-	}
-	if err := s.get(endpoint, &event); err != nil {
-		return 0, err
-	}
-	for _, e := range event.Entries {
-		if e.Type == "spans" {
-			var spans []json.RawMessage
-			if err := json.Unmarshal(e.Data, &spans); err != nil {
-				return 0, fmt.Errorf("decode spans entry: %w", err)
-			}
-			return len(spans), nil
-		}
-	}
-	return 0, nil
-}
+// traceDataset is the Discover dataset holding this org's transaction data.
+//
+// Sentry migrated transactions to the spans (EAP) dataset; dataset=transactions
+// now returns zero rows for this org for any query at any stats period, so a
+// trace probe pointed there reports received=0 with no send error and no query
+// error. Both trace probes must read this constant — the errors probe keeps
+// dataset=errors, which is still populated.
+const traceDataset = "spans"
 
 // findBatch queries Discover for events tagged probe_batch:batchID and returns
 // the set of distinct idField values seen. One request covers the whole batch,
@@ -141,36 +63,75 @@ func (s *sentryProbe) findBatch(dataset, batchID, idField string, limit int) (ma
 	return found, nil
 }
 
-// findBatchEventIDs returns traceID->eventID for transactions in the batch.
-// The event ID is what the span-count check needs to fetch the stored event.
-func (s *sentryProbe) findBatchEventIDs(batchID string, limit int) (map[string]string, error) {
+// findTraceBatch returns the set of trace ids from the batch that Sentry has
+// ingested. Both trace probes go through here so the dataset is chosen once:
+// the ingestion poll and the completeness sample cannot drift onto different
+// datasets and disagree about which traces arrived.
+func (s *sentryProbe) findTraceBatch(batchKey string, limit int) (map[string]bool, error) {
+	return s.findBatch(traceDataset, batchKey, "trace", limit)
+}
+
+// findBatchSpanCounts returns traceID -> number of child spans stored, for the
+// given traces, in ONE request. is_transaction:false excludes each trace's root
+// transaction span, so the count is children only and comparable to the number
+// of child spans the probe sent.
+//
+// A trace that arrived with no children at all is simply absent from the
+// result: the caller must read a missing trace as zero children (incomplete),
+// which it is, and is free to do so precisely because a failed census is
+// reported as an error instead.
+//
+// limit caps per_page. One row comes back per trace (count() aggregates the
+// children away), so len(traceIDs) is the natural bound.
+func (s *sentryProbe) findBatchSpanCounts(traceIDs []string, limit int) (map[string]int, error) {
+	// No traces sampled is not a failure, and must not become a request with an
+	// empty trace:[] filter — that would match every trace in the org.
+	if len(traceIDs) == 0 {
+		return map[string]int{}, nil
+	}
+
 	q := url.Values{}
-	q.Set("dataset", "transactions")
+	q.Set("dataset", traceDataset)
 	q.Set("statsPeriod", "1h")
-	q.Set("query", fmt.Sprintf("probe_batch:%s", batchID))
+	q.Set("query", fmt.Sprintf("trace:[%s] is_transaction:false", strings.Join(traceIDs, ",")))
 	q.Set("field", "trace")
-	q.Add("field", "id")
+	q.Add("field", "count()")
 	q.Set("per_page", strconv.Itoa(limit))
 
 	endpoint := fmt.Sprintf("%s/api/0/organizations/%s/events/?%s",
 		s.baseURL, url.PathEscape(s.org), q.Encode())
 
 	var result struct {
-		Data []struct {
-			Trace string `json:"trace"`
-			ID    string `json:"id"`
-		} `json:"data"`
+		Data []map[string]any `json:"data"`
 	}
 	if err := s.get(endpoint, &result); err != nil {
+		// Never a partial map alongside an error: an empty or half-filled map
+		// reads as "these traces lost their spans" and publishes a low
+		// completeness that says nothing about Sentry's span storage.
 		return nil, err
 	}
-	out := make(map[string]string, len(result.Data))
+
+	counts := make(map[string]int, len(result.Data))
 	for _, row := range result.Data {
-		if row.Trace != "" && row.ID != "" {
-			out[row.Trace] = row.ID
+		trace, _ := row["trace"].(string)
+		if trace == "" {
+			continue
 		}
+		raw, ok := row["count()"]
+		if !ok {
+			return nil, fmt.Errorf("span count for trace %s: no count() in row", trace)
+		}
+		// encoding/json decodes every JSON number into float64. Counts are
+		// small integers, exactly representable, so the conversion is lossless
+		// — but assert the type rather than assume it: a silent skip here would
+		// leave the trace absent and score it as span loss.
+		n, ok := raw.(float64)
+		if !ok {
+			return nil, fmt.Errorf("span count for trace %s: count() is %T, want number", trace, raw)
+		}
+		counts[trace] = int(n)
 	}
-	return out, nil
+	return counts, nil
 }
 
 func (s *sentryProbe) get(endpoint string, out any) error {

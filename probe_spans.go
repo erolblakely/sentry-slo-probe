@@ -2,93 +2,88 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"time"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
+	"log"
 )
 
 const expectedSpans = 5
 
-type spanResult struct {
-	traceID       string
-	sentSpans     int
-	receivedSpans int
-	pct           float64
-	latency       time.Duration
+// probeSpansBatch runs a batch of transactions and, on a sample of arrived
+// transactions, measures span completeness. The second return is the sampled
+// completeness percentage; the third reports whether that percentage is known.
+//
+// A false third return means "not measured", not "0% complete": a failed trace
+// lookup, a failed span census, or an empty sample carries no information about
+// completeness, and publishing 0 for it would manufacture a total-failure
+// reading out of an API hiccup. Callers must suppress the metric rather than
+// publish the zero.
+func probeSpansBatch(ctx context.Context, s *sentryProbe, cfg config, batchID string) (batchResult, float64, bool) {
+	res := runTraceBatch(ctx, s, cfg, batchID, spansSignal, "[span_completeness]", expectedSpans)
+
+	// Sampled completeness, in two requests regardless of batch size: one to
+	// list the traces that arrived, one to count their child spans. The batch
+	// key must be the same one runTraceBatch sent and queried under, so it comes
+	// from the same signal.
+	arrived, err := s.findTraceBatch(batchKeyFor(batchID, spansSignal), cfg.batchSize)
+	if err != nil {
+		log.Printf("[span_completeness] arrived traces: %v", err)
+		return res, 0, false
+	}
+
+	// cfg.spanSample bounds the census, not the batch: it caps URL length (33
+	// characters per trace id in the trace:[...] filter) and preserves the
+	// documented meaning of SPAN_COMPLETENESS_SAMPLE. Completeness stays a
+	// sample by design.
+	sampled := sampleTraceIDs(arrived, cfg.spanSample)
+	counts, err := s.findBatchSpanCounts(sampled, len(sampled))
+	if err != nil {
+		// The census failed, so no sampled trace has a known child-span count.
+		// Unknown, not zero.
+		log.Printf("[span_completeness] span counts: %v", err)
+		return res, 0, false
+	}
+	pct, known := completenessPct(sampled, counts, expectedSpans)
+	return res, pct, known
 }
 
-// probeSpans measures span completeness — what % of sent spans actually arrived.
-func probeSpans(ctx context.Context, s *sentryProbe, timeout, pollInterval time.Duration) (*spanResult, error) {
-	ctx, span := tracer.Start(ctx, "probe.span_completeness")
-	defer span.End()
-	span.SetAttributes(attribute.Int("sentry.expected_spans", expectedSpans))
-
-	traceID, sentAt, err := func() (string, time.Time, error) {
-		_, s2 := tracer.Start(ctx, "sentry.send_trace")
-		defer s2.End()
-		id, at, err := s.sendTraceWithSpans(expectedSpans)
-		if err != nil {
-			s2.RecordError(err)
-			s2.SetStatus(codes.Error, err.Error())
-		} else {
-			s2.SetStatus(codes.Ok, "")
-		}
-		return id, at, err
-	}()
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, fmt.Errorf("send trace: %w", err)
+// sampleTraceIDs takes up to n trace ids from the arrived set. Map iteration
+// order is randomised by the runtime and trace ids are random independently of
+// how Sentry handled them, so the first n are an unbiased sample.
+func sampleTraceIDs(arrived map[string]bool, n int) []string {
+	if n > len(arrived) {
+		n = len(arrived)
 	}
-	span.SetAttributes(attribute.String("sentry.trace_id", traceID))
-
-	var eventID string
-	attempts, err := pollWithSpan(ctx, "sentry.await_ingestion", timeout, pollInterval, func() (bool, error) {
-		found, id, err := s.traceExistsWithEventID(traceID)
-		if found {
-			eventID = id
-		}
-		return found, err
-	})
-	span.SetAttributes(attribute.Int("sentry.poll_attempts", attempts))
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return nil, fmt.Errorf("trace %s: %w", traceID, err)
+	if n <= 0 {
+		return nil
 	}
-
-	var received int
-	if _, fetchSpan := tracer.Start(ctx, "sentry.fetch_span_count"); true {
-		received, err = s.fetchEventSpanCount(eventID)
-		if err != nil {
-			fetchSpan.RecordError(err)
-			fetchSpan.SetStatus(codes.Error, err.Error())
-			fetchSpan.End()
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-			return nil, fmt.Errorf("fetch span count: %w", err)
+	out := make([]string, 0, n)
+	for id := range arrived {
+		if len(out) == n {
+			break
 		}
-		fetchSpan.SetAttributes(attribute.Int("sentry.received_spans", received))
-		fetchSpan.SetStatus(codes.Ok, "")
-		fetchSpan.End()
+		out = append(out, id)
 	}
+	return out
+}
 
-	pct := float64(received) / float64(expectedSpans) * 100
-	latency := time.Since(sentAt)
-	span.SetAttributes(
-		attribute.Int("sentry.received_spans", received),
-		attribute.Float64("sentry.completeness_pct", pct),
-		attribute.Int64("sentry.ingestion_latency_ms", latency.Milliseconds()),
-	)
-	span.SetStatus(codes.Ok, "")
-
-	return &spanResult{
-		traceID:       traceID,
-		sentSpans:     expectedSpans,
-		receivedSpans: received,
-		pct:           pct,
-		latency:       latency,
-	}, nil
+// completenessPct returns the percentage of sampled traces that arrived
+// complete, and whether the percentage is known at all.
+//
+// Completeness is all-or-nothing per trace: a trace counts only when Sentry
+// stored at least every child span the probe sent, so 100 traces each losing
+// one span of five read as 0%, not 80%. A sampled trace missing from counts had
+// no child spans stored — incomplete, and safe to score as such because the
+// caller only reaches here when the census itself succeeded.
+func completenessPct(sampled []string, counts map[string]int, expected int) (float64, bool) {
+	if len(sampled) == 0 {
+		// Nothing sampled: the batch may simply not have arrived. 0% here would
+		// read as Sentry dropping every span it was sent.
+		return 0, false
+	}
+	complete := 0
+	for _, id := range sampled {
+		if counts[id] >= expected {
+			complete++
+		}
+	}
+	return float64(complete) / float64(len(sampled)) * 100, true
 }

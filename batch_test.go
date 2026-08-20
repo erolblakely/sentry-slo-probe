@@ -105,6 +105,42 @@ func TestBatchDone(t *testing.T) {
 	}
 }
 
+// TestBatchConfigFrom pins the field-by-field mapping from process config onto
+// the batch engine's config. Every duration is a distinct value, so swapping
+// any two fields (sendWindow/pollTimeout in particular, which have the same
+// type and plausible magnitudes) fails here instead of surfacing as
+// inexplicable pacing during live testing. interval is set too and must not
+// appear in the batch config at all: it paces the outer loop, not the batch.
+func TestBatchConfigFrom(t *testing.T) {
+	cfg := config{
+		interval:     11 * time.Second,
+		pollTimeout:  22 * time.Second,
+		pollInterval: 33 * time.Second,
+		batchSize:    44,
+		sendWindow:   55 * time.Second,
+		spanSample:   66,
+	}
+	got := batchConfigFrom(cfg)
+
+	if got.size != cfg.batchSize {
+		t.Errorf("size = %d, want batchSize %d", got.size, cfg.batchSize)
+	}
+	if got.sendWindow != cfg.sendWindow {
+		t.Errorf("sendWindow = %s, want cfg.sendWindow %s", got.sendWindow, cfg.sendWindow)
+	}
+	if got.pollTimeout != cfg.pollTimeout {
+		t.Errorf("pollTimeout = %s, want cfg.pollTimeout %s", got.pollTimeout, cfg.pollTimeout)
+	}
+	if got.pollInterval != cfg.pollInterval {
+		t.Errorf("pollInterval = %s, want cfg.pollInterval %s", got.pollInterval, cfg.pollInterval)
+	}
+	// sendWorkers is fixed, not derived: pacing sets the send rate, the pool
+	// only absorbs the tail of slow flushes.
+	if got.sendWorkers != 8 {
+		t.Errorf("sendWorkers = %d, want 8", got.sendWorkers)
+	}
+}
+
 func TestRunBatchAllArrive(t *testing.T) {
 	cfg := batchConfig{
 		size: 5, sendWindow: 40 * time.Millisecond,
