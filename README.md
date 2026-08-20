@@ -10,7 +10,7 @@ Your error tracker is the thing you find out about outages from. This measures w
 |---|---|---|
 | **Trace ingestion** | How long until a transaction is queryable, and how many never are? | Sends a batch of probe transactions tagged with a batch id, polls Discover for that tag |
 | **Error ingestion** | How long until an error is queryable, and how many never are? | Sends a batch of probe errors, polls Discover for the batch tag |
-| **Span completeness** | Do all the spans actually arrive? | Sends transactions with 5 child spans each, then counts the spans Sentry stored on a sample of the ones that arrived |
+| **Span completeness** | Do all the spans actually arrive? | Sends transactions with 5 child spans each, then checks how many of a sample of the arrived ones came back with all 5 |
 
 Span completeness is the one that catches quiet data loss. A trace can arrive while some of its spans are silently dropped, so ingestion latency alone looks healthy.
 
@@ -46,11 +46,17 @@ Plus one metric from the span probe alone:
 
 | Metric | Unit | Meaning |
 |---|---|---|
-| `sentry.span_completeness.received_pct` | % | Spans stored ÷ spans sent, sampled over the transactions that arrived. **Not published at all** when the sample could not be taken — a gap in the series, rather than a fabricated `0%` that would read as total span loss. |
+| `sentry.span_completeness.received_pct` | % | Percentage of *sampled* transactions that arrived **complete** — all 5 child spans stored. **Not published at all** when the sample could not be taken — a gap in the series, rather than a fabricated `0%` that would read as total span loss. |
+
+Two things about `received_pct` matter before you put a threshold on it, and neither is obvious from the name.
+
+It is **all-or-nothing per transaction**, not a ratio of spans. `probe_spans.go` computes `complete / sample × 100`, where a transaction counts toward `complete` only if Sentry stored *all* of its 5 child spans. So 100 transactions each losing one span out of five read as **0%**, not 80%. A threshold of, say, 95 means "tolerate 5% of transactions losing spans", not "tolerate 5% span loss".
+
+It is a **sample, not a census**: at most `SPAN_COMPLETENESS_SAMPLE` (20 by default) of the transactions that arrived have their stored span count fetched, one API call each. Fetches that fail shrink the sample rather than scoring as incomplete, so a partly failing Sentry API narrows the measurement instead of biasing it downward.
 
 The trace signal is called `ingestion`, not `trace_ingestion`, so its metrics live under `sentry.ingestion.*` and its tag is `probe:ingestion`. All metrics are tagged `sentry_org:<org>`, `sentry_project:<project>`, and `probe:<signal>`.
 
-**There is no `sentry.ingestion.error` metric.** The old per-cycle failure counter was retired along with the single-event probe, and has no successor. Failures surface in two other places: `sentry.<signal>.sent` short of `PROBE_BATCH_SIZE` means *our* send path failed, and a low `sentry.<signal>.success_rate` means Sentry did not return what we did send. Keeping those apart matters — a monitor on `success_rate` alone reports our own send outage as a Sentry breach, which is why `scripts/setup_datadog_slos.sh` gates each one behind `sent > 0`.
+**There is no `sentry.ingestion.error` metric.** The old per-cycle failure counter was retired along with the single-event probe, and has no successor. Failures surface in two other places: `sentry.<signal>.sent` short of `PROBE_BATCH_SIZE` means *our* send path failed, and a low `sentry.<signal>.success_rate` means Sentry did not return what we did send. Keeping those apart matters — a monitor on `success_rate` alone reports our own send outage as a Sentry breach, which is why the paging monitors in `scripts/setup_datadog_slos.sh` gate each one behind `sent > 0`, and why the reliability SLOs divide `received` by `sent` instead of thresholding `success_rate`.
 
 If you are upgrading from the pre-batch metric names, note that Datadog does not roll a parent name up over its children: a query on `sentry.ingestion.latency_ms` does not match `sentry.ingestion.latency_ms.p95`. It goes permanently no-data instead of erroring, so nothing will tell you it broke.
 
@@ -73,13 +79,13 @@ docker compose up --build
 You should see a startup line, then a line per probe per cycle once its batch finishes draining:
 
 ```
-Starting SLO probes (run=3w5e11264sgsf, interval=2m0s, batch=100, send_window=1m40s, poll_timeout=2m0s, max_inflight=2)
+Starting SLO probes (run=dktnmz0ub263, interval=2m0s, batch=100, send_window=1m40s, poll_timeout=2m0s, max_inflight=2)
 [trace_ingestion] starting (interval=2m0s, batch=100)
 [error_ingestion] starting (interval=2m0s, batch=100)
 [span_completeness] starting (interval=2m0s, batch=100)
-[trace_ingestion] batch=3w5e11264sgsf-trace_ingestion-1 received=100/100 p50=3.1s p95=6.4s
-[error_ingestion] batch=3w5e11264sgsf-error_ingestion-1 received=99/100 p50=8.4s p95=14.2s
-[span_completeness] batch=3w5e11264sgsf-span_completeness-1 received=100/100 received_pct=100%
+[trace_ingestion] batch=dktnmz0ub263-trace_ingestion-1 received=100/100 p50=3.1s p95=6.4s
+[error_ingestion] batch=dktnmz0ub263-error_ingestion-1 received=99/100 p50=8.4s p95=14.2s
+[span_completeness] batch=dktnmz0ub263-span_completeness-1 received=100/100 received_pct=100%
 ```
 
 The `run=` component is regenerated on every start and prefixes every batch id, so a restart cannot re-query the previous process's events. `received_pct=unknown` means the completeness sample could not be taken this cycle; the metric is suppressed rather than reported as `0%`.
@@ -108,13 +114,15 @@ Optional:
 | `PROBE_SEND_WINDOW_SECONDS` | `100` | Batch sends are paced evenly across this window rather than fired at once |
 | `SPAN_COMPLETENESS_SAMPLE` | `20` | How many arrived transactions to fetch span counts for |
 
-A batch is bounded at `PROBE_SEND_WINDOW_SECONDS + POLL_TIMEOUT_SECONDS + POLL_INTERVAL_SECONDS` (225s at defaults), which is longer than the 120s interval, so two batches per probe overlap in normal operation. That is expected. A `skipping cycle` log line is not: it means a batch outlived twice the interval, which is past that ceiling, and points at a slow send path.
+A batch is bounded at `PROBE_SEND_WINDOW_SECONDS + POLL_TIMEOUT_SECONDS + POLL_INTERVAL_SECONDS` (225s at defaults), which is longer than the 120s interval, so two batches per probe overlap in normal operation. That is expected.
+
+A `skipping cycle` log line is not. It means a cycle outlived twice the interval (240s at defaults), which is past that ceiling. The send path is not what gets you there — its sends are paced across the window and bounded by a 10s flush timeout each. The work that can is what runs *after* the batch drains but still inside the same in-flight slot: the span probe's completeness sampling, up to `SPAN_COMPLETENESS_SAMPLE + 1` sequential Sentry calls at a 10s timeout apiece (~210s at defaults), and the six or seven Datadog submissions per signal, also 10s apiece (~60s). So a skip points at a slow Sentry event-detail API or a slow Datadog, not at a slow send.
 
 Note that the probe writes real events into the target Sentry project and consumes quota. Point it at a dedicated project if that matters to you.
 
 ## Creating the Datadog SLOs
 
-`scripts/setup_datadog_slos.sh` creates monitors plus monitor-based SLOs over the metrics above. It needs a Datadog **application** key in addition to the API key, and `jq`:
+`scripts/setup_datadog_slos.sh` creates monitors plus SLOs over the metrics above. It needs a Datadog **application** key in addition to the API key, and `jq`:
 
 ```bash
 export DD_API_KEY=... DD_APP_KEY=... SENTRY_ORG=... SENTRY_PROJECT=...
@@ -123,7 +131,16 @@ export DD_API_KEY=... DD_APP_KEY=... SENTRY_ORG=... SENTRY_PROJECT=...
 
 It is not idempotent — re-running creates duplicate monitors. The thresholds in it are starting points; tune them to your own ingestion behaviour once you have a few days of data.
 
-Each reliability SLO is backed by a **composite** of two monitors: `success_rate` below threshold, AND `sent > 0`. The gate is not optional — `success_rate` is published as `0` when nothing sent, so an ungated monitor turns a local send failure into a full SLO breach blamed on Sentry. The gate monitor sits in ALERT during normal operation by design; do not page on it, and do not fold the pair back into one monitor.
+**Six SLOs are created, of two different types, and both types are deliberate.**
+
+- The three **latency and span-completeness** SLOs are **monitor-based**: a metric monitor with a threshold, plus an SLO measuring what fraction of the 30-day window that monitor was not alerting. Those signals genuinely are gauges — p95 latency and `received_pct` are levels, not tallies — so there is no good/total ratio to divide, and "how much of the month was this level acceptable?" is the only question available.
+- The three **reliability** SLOs are **metric-based**: `sum(sentry.<signal>.received) / sum(sentry.<signal>.sent)`. Those two are real counts of events the batch probe tallies, so a good-events-over-total-events ratio is exactly what a metric-based SLO is for, and it measures every event rather than sampling whether a threshold monitor happened to be red.
+
+Neither type is a leftover from the other. No SLO is backed by a composite.
+
+Metric-based reliability gets the `sent > 0` gate structurally: a cycle that sent nothing contributes `0` to both numerator and denominator, so our own send failure cannot burn Sentry's error budget. Do not "simplify" those three into threshold SLOs over `success_rate` — `success_rate` is published as `0` when nothing sent, so such an SLO would record a full breach against Sentry for a local outage.
+
+Reliability **paging** is a separate path, and that is where the composites live. Each signal gets a **composite** of two monitors: `success_rate` below threshold, AND `sent > 0`. They alert; they back no SLO. The gate is still not optional here, for the same reason — an ungated `success_rate` monitor pages against Sentry for our own send failure. The gate monitor sits in ALERT during normal operation by design; do not page on it, and do not fold the pair back into one monitor.
 
 ## Project status
 

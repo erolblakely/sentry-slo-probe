@@ -135,10 +135,23 @@ func reportSpanCompleteness(dd *datadogClient, id string, res batchResult, pct f
 //
 // A *skip* is a different thing, and is not routine. Skipping needs two batches
 // still alive at one tick, which means a batch that has outlived 2 x interval =
-// 240s — 15s past the engine's own 225s ceiling, reachable only when <-sendDone
-// blocks on a slow flush. So overlap is expected; the skip log below is the
-// first sign the send path is dragging. The cap exists so that a Sentry stall
-// cannot grow the backlog without bound.
+// 240s — 15s past runBatch's own 225s ceiling.
+//
+// The send path cannot get you there, so do not read a skip as a slow flush:
+// runBatch's sender runs cfg.size sends over 8 workers at a 10s
+// batchFlushTimeout (probe.go), which bounds it near the send window itself.
+// The reachable causes all sit *outside* runBatch but *inside* the in-flight
+// slot, because limiter.done() is deferred around the whole run(id) closure:
+//
+//   - span-completeness sampling: up to SPAN_COMPLETENESS_SAMPLE+1 sequential
+//     Sentry calls at the 10s sentryHTTP timeout (probe_spans.go,
+//     sentry_api.go) — ~210s at defaults, on top of runBatch's 225s;
+//   - the Datadog submissions: six per signal, seven for span completeness, at
+//     the client's 10s timeout each (datadog.go) — ~60s.
+//
+// So overlap is expected, and a skip points at a slow Sentry event-detail API
+// or a slow Datadog, not at the send path. The cap exists so that neither can
+// grow the backlog without bound.
 const maxInflightBatches = 2
 
 // inflightCap bounds concurrent in-flight batches for one probe type.
@@ -240,9 +253,11 @@ func runBatchLoop(name string, cfg config, runID string, limiter *inflightCap, w
 		id := qualifyBatchID(runID, name, cycle)
 		if !limiter.try() {
 			// Two batches overlapping is normal (see maxInflightBatches); a skip
-			// is not. It means a batch has outlived 2x the interval, which is past
-			// the send+poll ceiling, so say that rather than calling it expected.
-			log.Printf("[%s] skipping cycle %d (batch=%s): %d batches still draining, at in-flight cap — a batch has outlived %s (2x the %s interval), past the send+poll ceiling: the send path is dragging",
+			// is not. It means a batch has outlived 2x the interval, past the
+			// send+poll ceiling — which the send path cannot cause, so the message
+			// names the work that can: the post-batch Sentry sampling and Datadog
+			// submissions that also run inside the in-flight slot.
+			log.Printf("[%s] skipping cycle %d (batch=%s): %d batches still draining, at in-flight cap — a batch has outlived %s (2x the %s interval), past the send+poll ceiling: check the Sentry event-detail API (span-completeness sampling) and Datadog submission latency, which run inside the slot after the batch drains",
 				name, cycle, id, limiter.max, 2*cfg.interval, cfg.interval)
 			return
 		}

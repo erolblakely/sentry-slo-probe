@@ -17,7 +17,10 @@
 #
 # and, from the span probe only:
 #
-#   sentry.span_completeness.received_pct (% of sent spans that arrived)
+#   sentry.span_completeness.received_pct (% of a SAMPLE of arrived
+#                                          transactions that had all their
+#                                          spans — see the monitor below; this
+#                                          is NOT spans stored / spans sent)
 #
 # The trace signal is named "ingestion", not "trace_ingestion", so its metrics
 # are sentry.ingestion.* and its tag is probe:ingestion. The other two tag
@@ -146,13 +149,31 @@ M_ERROR=$(create_monitor '{
 }')
 echo "  error-ingestion-latency monitor:   ${M_ERROR}"
 
-# received_pct is unchanged by the batch rewrite — still emitted, still a
-# percentage of spans stored over spans sent. This query is correct as written.
+# received_pct is unchanged by the batch rewrite — still emitted under the same
+# name, so this query is correct as written.
+#
+# READ WHAT THE METRIC IS BEFORE TUNING THIS THRESHOLD. Despite the name, it is
+# NOT spans stored over spans sent. probe_spans.go computes complete / sample *
+# 100 over a SAMPLE of at most SPAN_COMPLETENESS_SAMPLE (20) of the transactions
+# that arrived, where a transaction counts as complete only if Sentry stored ALL
+# 5 of its child spans. It is all-or-nothing per transaction: 100 transactions
+# each losing one span out of five read 0%, not 80%.
+#
+# Two consequences. "< 100" is the right threshold here — any sampled
+# transaction short of its full span count trips it — and a *lower* threshold
+# would mean "tolerate N% of transactions losing spans", not "tolerate N% span
+# loss". And because it is a sample rather than a census, a single sampled
+# transaction is worth 1/sample of the reading (5 points at the default 20), so
+# the series is coarse by construction. Fetches that fail shrink the sample
+# instead of scoring as incomplete, and a cycle whose sample could not be taken
+# at all publishes nothing rather than 0.
+#
+# The metric name is fixed and must not change; the meaning is the one above.
 M_SPANS=$(create_monitor '{
   "name": "Sentry span completeness (SLO source)",
   "type": "metric alert",
   "query": "avg(last_5m):avg:sentry.span_completeness.received_pct{'"${SCOPE}"',probe:span_completeness} < 100",
-  "message": "Sentry ingested fewer spans than were sent (span drop).",
+  "message": "At least one sampled probe transaction arrived in Sentry missing some of its 5 child spans (span drop). This is a sample of up to SPAN_COMPLETENESS_SAMPLE arrived transactions per cycle, scored all-or-nothing per transaction — see scripts/setup_datadog_slos.sh.",
   "tags": ["service:sentry-slo-probe","probe:span_completeness"],
   "options": {"thresholds": {"critical": 100}, "notify_no_data": true, "no_data_timeframe": 15, "renotify_interval": 0}
 }')
@@ -263,7 +284,7 @@ echo "==> Creating SLOs (30-day rolling window)"
 S1=$(create_slo '{
   "type": "monitor",
   "name": "Sentry trace ingestion latency",
-  "description": "99% of the time, a synthetic trace is queryable in Sentry within 60s.",
+  "description": "99% of the time, the p95 of a synthetic trace batch is queryable in Sentry within 60s. This is a batch percentile, not a per-event guarantee: the slowest 5% of a batch can exceed 60s without the monitor firing.",
   "monitor_ids": ['"${M_TRACE}"'],
   "thresholds": [{"timeframe": "30d", "target": 99.0, "warning": 99.5}],
   "tags": '"${TAGS}"'
@@ -273,7 +294,7 @@ echo "  SLO trace ingestion latency:       ${S1}"
 S2=$(create_slo '{
   "type": "monitor",
   "name": "Sentry error ingestion latency",
-  "description": "99% of the time, a synthetic error appears in Sentry Issues within 90s.",
+  "description": "99% of the time, the p95 of a synthetic error batch appears in Sentry Issues within 90s. This is a batch percentile, not a per-event guarantee: the slowest 5% of a batch can exceed 90s without the monitor firing.",
   "monitor_ids": ['"${M_ERROR}"'],
   "thresholds": [{"timeframe": "30d", "target": 99.0, "warning": 99.5}],
   "tags": '"${TAGS}"'
@@ -283,7 +304,7 @@ echo "  SLO error ingestion latency:       ${S2}"
 S3=$(create_slo '{
   "type": "monitor",
   "name": "Sentry span completeness",
-  "description": "99.5% of the time, all sent spans are ingested (no span drop).",
+  "description": "99.5% of the time, every sampled probe transaction arrived in Sentry with all 5 of its child spans (no span drop). Measured over a sample of up to SPAN_COMPLETENESS_SAMPLE arrived transactions per cycle, scored all-or-nothing per transaction — not as a ratio of spans stored to spans sent.",
   "monitor_ids": ['"${M_SPANS}"'],
   "thresholds": [{"timeframe": "30d", "target": 99.5, "warning": 99.9}],
   "tags": '"${TAGS}"'
@@ -358,11 +379,12 @@ S5=$(create_slo '{
 echo "  SLO error ingestion reliability:   ${S5}"
 
 # Distinct from the span completeness SLO above: this counts whole span-probe
-# transactions arriving, that one counts spans within a transaction that did.
+# transactions arriving, that one asks whether the transactions that did arrive
+# brought all their spans with them.
 S6=$(create_slo '{
   "type": "metric",
   "name": "Sentry span-probe transaction reliability",
-  "description": "Of the span-probe transactions the probe successfully sent, 99% become queryable in Sentry. Distinct from span completeness: this counts whole transactions arriving, that one counts spans within them. Cycles that sent nothing are absent from both numerator and denominator, so a local send failure cannot breach this SLO.",
+  "description": "Of the span-probe transactions the probe successfully sent, 99% become queryable in Sentry. Distinct from span completeness: this counts whole transactions arriving, that one asks whether the transactions that did arrive brought all their spans. Cycles that sent nothing are absent from both numerator and denominator, so a local send failure cannot breach this SLO.",
   "query": {
     "numerator": "sum:sentry.span_completeness.received{'"${SCOPE}"',probe:span_completeness}",
     "denominator": "sum:sentry.span_completeness.sent{'"${SCOPE}"',probe:span_completeness}"
