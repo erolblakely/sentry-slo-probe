@@ -10,7 +10,7 @@ Your error tracker is the thing you find out about outages from. This measures w
 |---|---|---|
 | **Trace ingestion** | How long until a transaction is queryable, and how many never are? | Sends a batch of probe transactions tagged with a batch id, polls Discover for that tag |
 | **Error ingestion** | How long until an error is queryable, and how many never are? | Sends a batch of probe errors, polls Discover for the batch tag |
-| **Span completeness** | Do all the spans actually arrive? | Sends transactions with 5 child spans each, then checks how many of a sample of the arrived ones came back with all 5 |
+| **Span completeness** | Do all the spans actually arrive? | Sends transactions with 5 child spans each, then counts the stored child spans of a sample of the arrived ones in a single grouped query |
 
 Span completeness is the one that catches quiet data loss. A trace can arrive while some of its spans are silently dropped, so ingestion latency alone looks healthy.
 
@@ -26,6 +26,8 @@ Span completeness is the one that catches quiet data loss. A trace can arrive wh
 ```
 
 Latency is wall-clock from send to the first successful query, so its **resolution is bounded by `POLL_INTERVAL_SECONDS`** (5s by default) — a 1-second ingestion and a 4-second ingestion may both report as one poll.
+
+**Expect traces to be far slower than errors — roughly 4-5x.** On the measured baseline (see [Project status](#project-status)) transactions came back at p50 57.1s / p95 66.1s against the error probe's p50 11.2s / p95 16.3s. That is surprising the first time you see it, and it is the single fact that most affects how you set thresholds: a latency threshold that is generous for the error probe sits *below* the healthy p95 of the trace probe and alerts forever. The two signals therefore get separate, deliberately non-comparable thresholds in `scripts/setup_datadog_slos.sh`.
 
 An OpenTelemetry exporter to Datadog's agentless OTLP intake (`otlp.<DD_SITE>`) is still configured, but **it currently emits no spans**. The single-event probes were the only things that created them, and the batch probes that replaced them are not self-instrumented — so there is nothing to see in APM. Its failure to initialise is logged and non-fatal.
 
@@ -52,7 +54,9 @@ Two things about `received_pct` matter before you put a threshold on it, and nei
 
 It is **all-or-nothing per transaction**, not a ratio of spans. `probe_spans.go` computes `complete / sample × 100`, where a transaction counts toward `complete` only if Sentry stored *all* of its 5 child spans. So 100 transactions each losing one span out of five read as **0%**, not 80%. A threshold of, say, 95 means "tolerate 5% of transactions losing spans", not "tolerate 5% span loss".
 
-It is a **sample, not a census**: at most `SPAN_COMPLETENESS_SAMPLE` (20 by default) of the transactions that arrived have their stored span count fetched, one API call each. Fetches that fail shrink the sample rather than scoring as incomplete, so a partly failing Sentry API narrows the measurement instead of biasing it downward.
+It is a **sample, not a census** of the batch: at most `SPAN_COMPLETENESS_SAMPLE` (20 by default) of the transactions that arrived are measured. Those are measured in **one** request, not one per transaction — a `count()` query over the spans dataset filtered to `trace:[<sampled ids>] is_transaction:false`, grouped by trace, so it returns stored child spans per trace with the root transaction span excluded. `SPAN_COMPLETENESS_SAMPLE` still bounds the measurement: it caps how many trace ids go into that single query.
+
+Because there is only one request, there is no per-transaction fetch left to fail. Either the query succeeds — in which case a sampled trace absent from the results genuinely has zero stored child spans, and is scored **incomplete** — or it fails outright, in which case nothing is known and the metric is suppressed for the cycle rather than published as a `0%` that would read as total span loss.
 
 The trace signal is called `ingestion`, not `trace_ingestion`, so its metrics live under `sentry.ingestion.*` and its tag is `probe:ingestion`. All metrics are tagged `sentry_org:<org>`, `sentry_project:<project>`, and `probe:<signal>`.
 
@@ -63,6 +67,10 @@ If you are upgrading from the pre-batch metric names, note that Datadog does not
 ## Quick start
 
 Requires Go 1.25.6, a Sentry auth token with `event:read` + `project:read` + `org:read`, and a Datadog API key.
+
+**Your Sentry org's transaction data must live in the spans (EAP) dataset.** The trace and span probes query `dataset=spans`; Sentry migrated transaction data there, and for a migrated org the older `transactions` dataset returns zero rows for every query at every stats period.
+
+If your org does not match that assumption, the failure is silent and looks nothing like a failure: transactions send successfully, every query comes back empty, and both trace probes report `received=0/N` with a **0% success rate, no send errors and no query errors**. The error probe reads `dataset=errors` and keeps working throughout, so the recognisable signature is one healthy probe alongside two flatlined at zero with clean logs. That is exactly how this was found; if you see it, check which dataset holds your transactions before looking anywhere else.
 
 ```bash
 cp .env.example .env    # then fill in your real values
@@ -83,12 +91,16 @@ Starting SLO probes (run=dktnmz0ub263, interval=2m0s, batch=100, send_window=1m4
 [trace_ingestion] starting (interval=2m0s, batch=100)
 [error_ingestion] starting (interval=2m0s, batch=100)
 [span_completeness] starting (interval=2m0s, batch=100)
-[trace_ingestion] batch=dktnmz0ub263-trace_ingestion-1 received=100/100 p50=3.1s p95=6.4s
-[error_ingestion] batch=dktnmz0ub263-error_ingestion-1 received=99/100 p50=8.4s p95=14.2s
+[trace_ingestion] batch=dktnmz0ub263-trace_ingestion-1 received=100/100 p50=58.4s p95=1m7.2s
+[error_ingestion] batch=dktnmz0ub263-error_ingestion-1 received=99/100 p50=11.9s p95=16.8s
 [span_completeness] batch=dktnmz0ub263-span_completeness-1 received=100/100 received_pct=100%
 ```
 
+Those latencies are illustrative, but their *shape* is real: traces take roughly 5x as long as errors to become queryable. The measured baseline is in [Project status](#project-status).
+
 The `run=` component is regenerated on every start and prefixes every batch id, so a restart cannot re-query the previous process's events. `received_pct=unknown` means the completeness sample could not be taken this cycle; the metric is suppressed rather than reported as `0%`.
+
+`received=0/N` on the two trace probes, with no errors of any kind, is the signature of transaction data not being in the spans dataset — see the note in [Quick start](#quick-start).
 
 ## Configuration
 
@@ -112,11 +124,11 @@ Optional:
 | `POLL_INTERVAL_SECONDS` | `5` | How often to poll — also the latency resolution |
 | `PROBE_BATCH_SIZE` | `100` | Events sent per probe per cycle |
 | `PROBE_SEND_WINDOW_SECONDS` | `100` | Batch sends are paced evenly across this window rather than fired at once |
-| `SPAN_COMPLETENESS_SAMPLE` | `20` | How many arrived transactions to fetch span counts for |
+| `SPAN_COMPLETENESS_SAMPLE` | `20` | How many arrived transactions go into the single span-count query |
 
 A batch is bounded at `PROBE_SEND_WINDOW_SECONDS + POLL_TIMEOUT_SECONDS + POLL_INTERVAL_SECONDS` (225s at defaults), which is longer than the 120s interval, so two batches per probe overlap in normal operation. That is expected.
 
-A `skipping cycle` log line is not. It means a cycle outlived twice the interval (240s at defaults), which is past that ceiling. The send path is not what gets you there — its sends are paced across the window and bounded by a 10s flush timeout each. The work that can is what runs *after* the batch drains but still inside the same in-flight slot: the span probe's completeness sampling, up to `SPAN_COMPLETENESS_SAMPLE + 1` sequential Sentry calls at a 10s timeout apiece (~210s at defaults), and the six or seven Datadog submissions per signal, also 10s apiece (~60s). So a skip points at a slow Sentry event-detail API or a slow Datadog, not at a slow send.
+A `skipping cycle` log line is not. It means a cycle outlived twice the interval (240s at defaults), which is past that ceiling. The send path is not what gets you there — its sends are paced across the window and bounded by a 10s flush timeout each. The work that can is what runs *after* the batch drains but still inside the same in-flight slot: the span probe's completeness census, exactly two Sentry Discover calls at a 10s timeout apiece (~20s, and flat in `SPAN_COMPLETENESS_SAMPLE`), and the six or seven Datadog submissions per signal, also 10s apiece (~60s). So a skip points at slow Datadog submission or an unusually slow Sentry Discover query, not at a slow send. Post-batch work no longer scales with the sample size, so skips should be rare.
 
 Note that the probe writes real events into the target Sentry project and consumes quota. Point it at a dedicated project if that matters to you.
 
@@ -129,7 +141,9 @@ export DD_API_KEY=... DD_APP_KEY=... SENTRY_ORG=... SENTRY_PROJECT=...
 ./scripts/setup_datadog_slos.sh
 ```
 
-It is not idempotent — re-running creates duplicate monitors. The thresholds in it are starting points; tune them to your own ingestion behaviour once you have a few days of data.
+It is not idempotent — re-running creates duplicate monitors.
+
+The latency thresholds in it are set against the measured baseline below rather than guessed: trace p95 alerts above 120s (~2x the observed 66s), error p95 above 90s (~5.5x the observed 16s, left deliberately loose pending more data). Each carries a comment in the script recording the observation it was set from. Re-check both against a few days of your own org's data — and read those comments first, because the trace and error thresholds are not comparable to each other.
 
 **Six SLOs are created, of two different types, and both types are deliberate.**
 
@@ -144,6 +158,18 @@ Reliability **paging** is a separate path, and that is where the composites live
 
 ## Project status
 
+**Verified end to end against live Sentry and Datadog on 2026-08-20.** All three probes send, all three come back queryable, and all three publish to Datadog. Two clean cycles at `PROBE_BATCH_SIZE=10`:
+
+| Probe | Received | p50 | p95 |
+|---|---|---|---|
+| `error_ingestion` | 10/10 | 11.204s | 16.261s |
+| `trace_ingestion` | 10/10 | 57.122s | 66.129s |
+| `span_completeness` | 10/10 | — | `received_pct=100%` |
+
+Zero send errors, zero query errors, zero Datadog post errors, zero skipped cycles. The batch path is confirmed working: paced sends, batched polling, percentiles and success rates all arrive in Datadog.
+
+Use those numbers as a **reference baseline, not a guarantee**. Two cycles at batch size 10 is a first measurement, not a soak test — it says nothing about the tail beyond p95, about behaviour at the default batch size of 100, or about how any of this drifts over days.
+
 This branch (`batched-slo-probes`) sends a paced batch of events per probe per cycle, and the batch path **is** wired into `main.go` — the legacy single-event path has been deleted. That is what turns the latency signal into real p50/p95/p99 percentiles plus a success rate rather than a single sample, and it is why the metric names in this README differ from the ones the released code emits.
 
 The `main` branch still runs **one synthetic event per probe per cycle** and still emits the pre-batch metric names, so any dashboards built against it need updating before this branch merges. The design and task plan live in `docs/`.
@@ -155,7 +181,7 @@ main.go          config + the three batch probe loops
 probe.go         trace ingestion batch probe, Sentry send helpers
 probe_error.go   error ingestion batch probe
 probe_spans.go   span completeness batch probe
-sentry_api.go    Sentry Discover / event-detail queries
+sentry_api.go    Sentry Discover queries (spans + errors datasets)
 datadog.go       Datadog v2 series submission
 tracer.go        OTel → Datadog agentless OTLP setup (configured, emits no spans)
 batch.go         batch engine: paced sends, batched polling, latency tracking
