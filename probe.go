@@ -167,7 +167,7 @@ func runTraceBatch(ctx context.Context, s *sentryProbe, cfg config, batchID, sig
 		return sendTraceTagged(client, batchKey, seq, spans)
 	}
 	query := func(ctx context.Context) (map[string]bool, error) {
-		return s.findBatch("transactions", batchKey, "trace", cfg.batchSize)
+		return s.findTraceBatch(batchKey, cfg.batchSize)
 	}
 	return runBatch(ctx, batchConfigFrom(cfg), send, query)
 }
