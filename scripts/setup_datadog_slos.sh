@@ -2,8 +2,8 @@
 #
 # setup_datadog_slos.sh
 #
-# Creates the Datadog monitors + monitor-based SLOs that track Sentry's
-# ingestion performance, using the metrics emitted by this probe.
+# Creates the Datadog monitors + SLOs that track Sentry's ingestion
+# performance, using the metrics emitted by this probe.
 #
 # The probe sends a paced *batch* of synthetic events per cycle, so for each
 # signal in {ingestion, error_ingestion, span_completeness} it emits:
@@ -31,8 +31,9 @@
 # per-cycle error counter went away with the single-event probe. Failures now
 # surface two ways: as a gap between sentry.<signal>.sent and PROBE_BATCH_SIZE
 # (our own send path failed), and as a low sentry.<signal>.success_rate (we
-# sent, Sentry did not give them back). The reliability monitors below watch the
-# second, gated on the first.
+# sent, Sentry did not give them back). The reliability paging monitors below
+# watch the second, gated on the first; the reliability SLOs get the same
+# separation for free by dividing received by sent.
 #
 # Datadog does NOT roll a parent metric name up over its children: a query on
 # sentry.ingestion.latency_ms matches nothing now that the series is
@@ -41,10 +42,29 @@
 # or monitor still on the pre-batch names needs the same treatment this script
 # just got.
 #
-# Each SLO is *monitor-based*: we create a metric monitor with a threshold,
-# then an SLO that tracks "% of time the monitor was NOT alerting" over 30d.
-# This is the right SLO type for gauge metrics (a metric-based SLO wants
-# count numerator/denominator, which these gauges don't provide cleanly).
+# TWO KINDS OF SLO LIVE IN THIS FILE, AND BOTH ARE DELIBERATE.
+#
+#   * Latency and span completeness are *monitor-based*: a metric monitor with
+#     a threshold, plus an SLO tracking "% of time that monitor was NOT
+#     alerting" over 30d. Those signals genuinely are gauges — p95 latency and
+#     received_pct are levels, not tallies. There is no meaningful
+#     good-events/total-events ratio to divide, so "how much of the month was
+#     this level acceptable?" is the only question that can be asked, and
+#     monitor-based is the SLO type that asks it.
+#
+#   * Reliability is *metric-based*: numerator sentry.<signal>.received over
+#     denominator sentry.<signal>.sent. These two ARE tallies — the batch probe
+#     counts the events it got out the door and the events that came back
+#     (datadog.go, postBatchMetrics) — so the ratio is a real good/total event
+#     ratio and metric-based measures it directly, event by event, instead of
+#     sampling whether a threshold monitor happened to be red.
+#
+# An earlier version of this header claimed monitor-based was right for
+# everything because "a metric-based SLO wants count numerator/denominator,
+# which these gauges don't provide cleanly". That was true of the OLD
+# single-event probe, which emitted only latency gauges. The batch rewrite made
+# it false. Do not restore that reasoning: the two kinds coexist here on
+# purpose, and neither is a leftover.
 #
 # PREREQUISITES
 #   export DD_API_KEY=...    # same key the probe uses
@@ -138,21 +158,28 @@ M_SPANS=$(create_monitor '{
 }')
 echo "  span-completeness monitor:         ${M_SPANS}"
 
-# --- Reliability: success_rate, gated on sent > 0 -----------------------------
+# --- Reliability PAGING monitors: success_rate, gated on sent > 0 -------------
 #
-# This replaces the old sentry.ingestion.error monitor, whose metric no longer
+# These replace the old sentry.ingestion.error monitor, whose metric no longer
 # exists.
 #
-# WHY A COMPOSITE. Do not "simplify" this into a single success_rate monitor.
+# COMPOSITES PAGE, METRIC-BASED SLOs MEASURE. Read that before changing either.
+# The composites built here are the *alerting* path: they are what wakes someone
+# up when Sentry starts dropping events. They do NOT back the reliability SLOs
+# any more — those are metric-based over received/sent, further down. The two
+# express the same intent by different means on purpose: an alert has to make a
+# yes/no call in a 10-minute window, while an SLO integrates every event over
+# 30 days.
+#
+# WHY A COMPOSITE AND NOT A BARE success_rate MONITOR. Do not "simplify" this.
 #
 # success_rate is deliberately published as 0 when sent == 0 (received/sent is
 # NaN there, and a metric that never arrives looks identical to a healthy one on
 # a dashboard, so the probe posts an explicit 0 instead). But sent == 0 means
 # *our* send path failed — bad DSN, no egress, the SDK refusing to flush. A bare
 # "success_rate < N" monitor cannot tell that apart from Sentry dropping every
-# event, so it would fire a full SLO breach against Sentry for our own outage.
-# That is the single worst failure mode an SLO tool has: a confident false
-# accusation.
+# event, so it would page against Sentry for our own outage. That is the single
+# worst failure mode an SLO tool has: a confident false accusation.
 #
 # So each signal gets two metric monitors and one composite over them:
 #
@@ -162,8 +189,11 @@ echo "  span-completeness monitor:         ${M_SPANS}"
 #
 # Monitor B sits in ALERT state throughout normal healthy operation, by design.
 # It is a gate, not a page: it carries no notification handles, and nothing
-# should ever be routed off it directly. Only C is paged on, and only C backs
-# the SLO.
+# should ever be routed off it directly. Only C is paged on.
+#
+# A and B are referenced only by their composite now that the SLOs no longer
+# consume them. That is fine and they must not be deleted: C is defined in terms
+# of their ids, so removing either breaks the composite.
 #
 # A probe that is not running at all leaves sent at no-data -> default_zero -> 0,
 # so B is not alerting and C stays quiet. Deliberate: "the probe is down" is a
@@ -173,6 +203,9 @@ echo "  span-completeness monitor:         ${M_SPANS}"
 # create_reliability_monitor <metric signal> <probe tag> <threshold %> <label>
 # Prints the composite monitor id on stdout; progress goes to stderr, because
 # the caller captures stdout.
+#
+# The returned id is for routing notifications, not for an SLO. Nothing below
+# passes it to create_slo.
 create_reliability_monitor() {
   local signal="$1" probe_tag="$2" threshold="$3" label="$4"
   local m_rate m_sent m_comp
@@ -181,7 +214,7 @@ create_reliability_monitor() {
   # PROBE_INTERVAL_SECONDS (120s by default), and a window that spans several
   # batches keeps one unlucky batch from tripping the SLO.
   m_rate=$(create_monitor '{
-  "name": "Sentry '"${label}"' success rate (SLO source, part A of composite)",
+  "name": "Sentry '"${label}"' success rate (alert part A of composite)",
   "type": "metric alert",
   "query": "avg(last_10m):avg:sentry.'"${signal}"'.success_rate{'"${SCOPE}"',probe:'"${probe_tag}"'} < '"${threshold}"'",
   "message": "Fewer than '"${threshold}"'% of the synthetic '"${label}"' events sent became queryable in Sentry. Gated by the sent>0 monitor through a composite — see scripts/setup_datadog_slos.sh.",
@@ -190,7 +223,7 @@ create_reliability_monitor() {
 }')
 
   m_sent=$(create_monitor '{
-  "name": "Sentry '"${label}"' sent>0 gate (SLO source, part B of composite — DO NOT PAGE)",
+  "name": "Sentry '"${label}"' sent>0 gate (alert part B of composite — DO NOT PAGE)",
   "type": "metric alert",
   "query": "avg(last_10m):default_zero(avg:sentry.'"${signal}"'.sent{'"${SCOPE}"',probe:'"${probe_tag}"'}) > 0",
   "message": "Gate only. ALERTING here is the NORMAL, HEALTHY state: it means the probe is successfully sending '"${label}"' events. Consumed by a composite monitor so a local send failure cannot be reported as a Sentry breach. Do not route notifications off this monitor and do not delete it without deleting its composite.",
@@ -199,10 +232,10 @@ create_reliability_monitor() {
 }')
 
   m_comp=$(create_monitor '{
-  "name": "Sentry '"${label}"' reliability (SLO source)",
+  "name": "Sentry '"${label}"' reliability (paging)",
   "type": "composite",
   "query": "'"${m_rate}"' && '"${m_sent}"'",
-  "message": "Sentry returned fewer than '"${threshold}"'% of the synthetic '"${label}"' events we successfully sent. The sent>0 gate is satisfied, so this is Sentry dropping events, not the probe failing to send them.",
+  "message": "Sentry returned fewer than '"${threshold}"'% of the synthetic '"${label}"' events we successfully sent. The sent>0 gate is satisfied, so this is Sentry dropping events, not the probe failing to send them. This monitor pages; the corresponding SLO is metric-based over received/sent and is measured independently of this alert.",
   "tags": ["service:sentry-slo-probe","probe:'"${probe_tag}"'"],
   "options": {"renotify_interval": 0}
 }')
@@ -213,11 +246,19 @@ create_reliability_monitor() {
   echo "${m_comp}"
 }
 
-M_REL_TRACE=$(create_reliability_monitor "ingestion" "ingestion" 99 "trace ingestion")
-M_REL_ERROR=$(create_reliability_monitor "error_ingestion" "error_ingestion" 99 "error ingestion")
-M_REL_SPANS=$(create_reliability_monitor "span_completeness" "span_completeness" 99 "span-probe transaction")
+# Signal name vs probe tag: the trace signal is "ingestion" in the code, so its
+# metrics are sentry.ingestion.* and its tag is probe:ingestion. It is NOT
+# probe:trace_ingestion — that value is emitted nowhere and would leave these
+# monitors silently no-data. The other two signals tag themselves with their own
+# names. Verified against datadog.go (postBatchMetrics tags "probe:"+signal).
+M_PAGE_TRACE=$(create_reliability_monitor "ingestion" "ingestion" 99 "trace ingestion")
+M_PAGE_ERROR=$(create_reliability_monitor "error_ingestion" "error_ingestion" 99 "error ingestion")
+M_PAGE_SPANS=$(create_reliability_monitor "span_completeness" "span_completeness" 99 "span-probe transaction")
 
-echo "==> Creating monitor-based SLOs (30-day rolling window)"
+echo "  reliability paging composites:     ${M_PAGE_TRACE}, ${M_PAGE_ERROR}, ${M_PAGE_SPANS}"
+echo "     (route notifications here; the reliability SLOs below do not use them)"
+
+echo "==> Creating SLOs (30-day rolling window)"
 
 S1=$(create_slo '{
   "type": "monitor",
@@ -249,45 +290,84 @@ S3=$(create_slo '{
 }')
 echo "  SLO span completeness:             ${S3}"
 
-# The reliability SLOs track the *composite* (C), never part A on its own —
-# an SLO over the ungated success_rate would burn error budget every time our
-# own send path failed, which is the whole reason the gate exists.
+# --- Reliability SLOs: metric-based over received / sent ----------------------
 #
-# Datadog's monitor-based SLO docs list metric, synthetic and service-check
-# monitors as sources and do not mention composites. If the /slo call below is
-# rejected for M_REL_*, create_slo prints the API error and the script exits
-# non-zero — it will not create a half-configured SLO silently. In that case
-# keep the composites as the paging monitors and build these three as
-# metric-based SLOs over sentry.<signal>.received / sentry.<signal>.sent
-# (numerator/denominator), which carries the same gate implicitly: a window with
-# no sends has an empty denominator and is excluded rather than counted as a
-# breach.
+# THE sent>0 GATE IS IMPLICIT AND STRUCTURAL HERE. THIS IS THE WHOLE POINT.
+# Do not "simplify" these into threshold SLOs over sentry.<signal>.success_rate.
+#
+# A metric-based SLO is sum(good events) / sum(total events) across the whole
+# 30-day window. When a batch fails to send, that cycle publishes sent=0 and
+# received=0, so it contributes 0 to the numerator and 0 to the denominator. It
+# cannot move the ratio. Our own send failure is arithmetically incapable of
+# burning Sentry's error budget — not because we bolted a gate on, but because
+# there is nothing to divide. Zero sends means zero opportunity for Sentry to
+# fail us, and the SLO says so by construction.
+#
+# Contrast the thing not to build. success_rate is published as an explicit 0
+# when sent == 0 (see the paging section above for why). An SLO thresholding
+# "success_rate >= 99" would read that 0 as a total ingestion failure and record
+# a full breach against Sentry for our own outage. Same false accusation the
+# composite gate exists to prevent, silently reintroduced. The metric-based form
+# below is immune to it for free, so keep it.
+#
+# It also measures the right thing. The retired monitor-based version asked "for
+# what fraction of the month was the 10-minute success rate above 99%?" — a
+# sample of a threshold, where one bad 10-minute window costs the same whether
+# it dropped one event or every event. This asks "of every synthetic event we
+# actually sent this month, what fraction did Sentry give back?" That is the
+# real SLI, and it is why the targets changed shape: 99.0 here is a ratio of
+# events, NOT the old 99.9 ratio of good minutes. The two numbers are not
+# comparable and 99.9 must not be "restored" here.
+#
+# Targets match the paging composites' 99% threshold on purpose, so the alert
+# and the SLO encode one intent rather than drifting apart.
+#
+# ONE THING TO CHECK ON THE FIRST REAL RUN. Datadog documents metric-based SLOs
+# as supporting COUNT, RATE and percentile-enabled DISTRIBUTION metrics. The
+# probe submits every metric as a gauge ("type": 3 in datadog.go's postMetric),
+# including .sent and .received, which are semantically counts but are not
+# typed as such. If Datadog rejects these three /slo calls, or accepts them and
+# the resulting SLI looks wrong, the fix is in the probe rather than here:
+# submit .sent and .received with the count type and leave these queries alone.
+# create_slo prints the API error and exits non-zero, so a rejection is loud
+# rather than a half-configured SLO.
 S4=$(create_slo '{
-  "type": "monitor",
+  "type": "metric",
   "name": "Sentry trace ingestion reliability",
-  "description": "99.9% of the time, at least 99% of the synthetic traces we sent were queryable in Sentry.",
-  "monitor_ids": ['"${M_REL_TRACE}"'],
-  "thresholds": [{"timeframe": "30d", "target": 99.9, "warning": 99.95}],
+  "description": "Of the synthetic traces the probe successfully sent, 99% become queryable in Sentry. Cycles that sent nothing are absent from both numerator and denominator, so a local send failure cannot breach this SLO.",
+  "query": {
+    "numerator": "sum:sentry.ingestion.received{'"${SCOPE}"',probe:ingestion}",
+    "denominator": "sum:sentry.ingestion.sent{'"${SCOPE}"',probe:ingestion}"
+  },
+  "thresholds": [{"timeframe": "30d", "target": 99.0, "warning": 99.5}],
   "tags": '"${TAGS}"'
 }')
 echo "  SLO trace ingestion reliability:   ${S4}"
 
 S5=$(create_slo '{
-  "type": "monitor",
+  "type": "metric",
   "name": "Sentry error ingestion reliability",
-  "description": "99.9% of the time, at least 99% of the synthetic errors we sent were queryable in Sentry.",
-  "monitor_ids": ['"${M_REL_ERROR}"'],
-  "thresholds": [{"timeframe": "30d", "target": 99.9, "warning": 99.95}],
+  "description": "Of the synthetic errors the probe successfully sent, 99% become queryable in Sentry. Cycles that sent nothing are absent from both numerator and denominator, so a local send failure cannot breach this SLO.",
+  "query": {
+    "numerator": "sum:sentry.error_ingestion.received{'"${SCOPE}"',probe:error_ingestion}",
+    "denominator": "sum:sentry.error_ingestion.sent{'"${SCOPE}"',probe:error_ingestion}"
+  },
+  "thresholds": [{"timeframe": "30d", "target": 99.0, "warning": 99.5}],
   "tags": '"${TAGS}"'
 }')
 echo "  SLO error ingestion reliability:   ${S5}"
 
+# Distinct from the span completeness SLO above: this counts whole span-probe
+# transactions arriving, that one counts spans within a transaction that did.
 S6=$(create_slo '{
-  "type": "monitor",
+  "type": "metric",
   "name": "Sentry span-probe transaction reliability",
-  "description": "99.9% of the time, at least 99% of the span-probe transactions we sent were queryable in Sentry. Distinct from span completeness: this counts whole transactions arriving, that one counts spans within them.",
-  "monitor_ids": ['"${M_REL_SPANS}"'],
-  "thresholds": [{"timeframe": "30d", "target": 99.9, "warning": 99.95}],
+  "description": "Of the span-probe transactions the probe successfully sent, 99% become queryable in Sentry. Distinct from span completeness: this counts whole transactions arriving, that one counts spans within them. Cycles that sent nothing are absent from both numerator and denominator, so a local send failure cannot breach this SLO.",
+  "query": {
+    "numerator": "sum:sentry.span_completeness.received{'"${SCOPE}"',probe:span_completeness}",
+    "denominator": "sum:sentry.span_completeness.sent{'"${SCOPE}"',probe:span_completeness}"
+  },
+  "thresholds": [{"timeframe": "30d", "target": 99.0, "warning": 99.5}],
   "tags": '"${TAGS}"'
 }')
 echo "  SLO span-probe reliability:        ${S6}"
