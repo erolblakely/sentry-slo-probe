@@ -130,7 +130,7 @@ var spanBatchMetrics = []string{
 // closure in main and so had no automated protection; the function exists to be
 // testable, and this is the test.
 func TestReportSpanCompleteness(t *testing.T) {
-	res := batchResult{sent: 10, received: 10, latencies: []time.Duration{time.Second}}
+	res := batchResult{sent: 10, received: 10, latencies: []time.Duration{time.Second}, measured: true}
 	wantTags := []string{"probe:span_completeness", "sentry_org:o", "sentry_project:p"}
 
 	t.Run("unknown completeness suppresses received_pct", func(t *testing.T) {
@@ -166,6 +166,18 @@ func TestReportSpanCompleteness(t *testing.T) {
 		if got := metricValue(t, series, "sentry.span_completeness.received_pct"); got != 80 {
 			t.Errorf("received_pct = %v, want 80", got)
 		}
+		// received_pct is a level (a percentage of a sample), not a tally, and it
+		// backs a monitor-based SLO. Gauge is correct for it; count would be
+		// nonsense. The two tallies in the same payload are counts.
+		assertMetricTypes(t, series, map[string]int{
+			"sentry.span_completeness.latency_ms.p50": ddTypeGauge,
+			"sentry.span_completeness.latency_ms.p95": ddTypeGauge,
+			"sentry.span_completeness.latency_ms.p99": ddTypeGauge,
+			"sentry.span_completeness.sent":           ddTypeCount,
+			"sentry.span_completeness.received":       ddTypeCount,
+			"sentry.span_completeness.success_rate":   ddTypeGauge,
+			"sentry.span_completeness.received_pct":   ddTypeGauge,
+		})
 		// Every series, received_pct included, carries the org/project tags plus
 		// the probe tag — a mistagged metric is invisible to the monitor scope.
 		assertTags(t, series, wantTags)

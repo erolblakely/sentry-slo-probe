@@ -35,6 +35,42 @@ func TestFindBatch(t *testing.T) {
 	}
 }
 
+// TestFindBatchClampsPerPage: per_page is the whole retrieval mechanism here —
+// one request, no pagination, no Link-header handling — and Sentry documents its
+// maximum on this endpoint as 100. configFromEnv rejects a batch size above that
+// so an operator finds out at startup, but findBatch clamps as well: it is
+// called with a caller-supplied limit, and a request Sentry 400s returns zero
+// rows, which reads as a total ingestion failure rather than as our own bad
+// request.
+func TestFindBatchClampsPerPage(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.Query().Get("per_page")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer srv.Close()
+
+	s := newSentryProbe("dsn", "tok", "org", "proj")
+	s.baseURL = srv.URL
+
+	if _, err := s.findBatch("errors", "B1", "probe_seq", 5000); err != nil {
+		t.Fatalf("findBatch: %v", err)
+	}
+	if got != "100" {
+		t.Errorf("per_page = %q for limit 5000, want it clamped to 100", got)
+	}
+
+	// A nonsensical limit must not become per_page=0 or a negative, which Sentry
+	// would reject or read as "no rows".
+	if _, err := s.findBatch("errors", "B1", "probe_seq", 0); err != nil {
+		t.Fatalf("findBatch: %v", err)
+	}
+	if got != "1" {
+		t.Errorf("per_page = %q for limit 0, want the floor of 1", got)
+	}
+}
+
 // TestFindTraceBatchQueriesSpansDataset pins the dataset both trace probes poll.
 // Sentry has migrated this org's transaction data to the spans (EAP) dataset:
 // dataset=transactions returns zero rows for any query, at any stats period, so

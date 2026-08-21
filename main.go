@@ -34,7 +34,10 @@ func main() {
 	}
 
 	s := newSentryProbe(cfg.sentryDSN, cfg.sentryAuthToken, cfg.sentryOrg, cfg.sentryProject)
-	dd := newDatadogClient(cfg.ddAPIKey, cfg.ddSite)
+	// The interval is handed to the Datadog client because count metrics carry it:
+	// one point per signal per cycle, so the probe's own cadence is the count
+	// interval.
+	dd := newDatadogClient(cfg.ddAPIKey, cfg.ddSite, cfg.interval)
 
 	baseTags := []string{
 		fmt.Sprintf("sentry_org:%s", cfg.sentryOrg),
@@ -125,20 +128,24 @@ func reportSpanCompleteness(dd *datadogClient, id string, res batchResult, pct f
 	// appending in place would be a concurrent write to a shared backing array
 	// the moment baseTags has spare capacity, and would scribble one probe's tag
 	// into another's metrics.
-	dd.postMetricLogged("sentry.span_completeness.received_pct", pct,
+	// A gauge, deliberately: received_pct is a percentage of a sample — a level,
+	// not a tally — and it backs a monitor-based SLO. Only .sent and .received
+	// are counts.
+	dd.postMetricLogged("sentry.span_completeness.received_pct", ddTypeGauge, pct,
 		append(append([]string{}, baseTags...), "probe:span_completeness"))
 }
 
 // maxInflightBatches bounds concurrent batches per probe signal.
 //
 // This is load-bearing, not decorative. At defaults one batch is bounded at
-// sendWindow (100s) + pollTimeout (120s) + pollInterval (5s) = 225s against an
-// interval of 120s, so consecutive batches overlap in normal healthy operation:
-// two in flight is the expected steady state.
+// lastSendOffset (99s: sends are paced at sendWindow/size, so the last of 100
+// leaves at 99/100 x 100s) + pollTimeout (120s) + pollInterval (5s) = 224s
+// against an interval of 120s, so consecutive batches overlap in normal healthy
+// operation: two in flight is the expected steady state.
 //
 // A *skip* is a different thing, and is not routine. Skipping needs two batches
 // still alive at one tick, which means a batch that has outlived 2 x interval =
-// 240s — 15s past runBatch's own 225s ceiling.
+// 240s — 16s past runBatch's own 224s ceiling.
 //
 // The send path cannot get you there, so do not read a skip as a slow flush:
 // runBatch's sender runs cfg.size sends over 8 workers at a 10s
@@ -150,8 +157,11 @@ func reportSpanCompleteness(dd *datadogClient, id string, res batchResult, pct f
 //     10s sentryHTTP timeout (probe_spans.go, sentry_api.go) — one Discover
 //     query for the traces that arrived, one grouped count() census over the
 //     sample — so ~20s worst case, and flat in SPAN_COMPLETENESS_SAMPLE;
-//   - the Datadog submissions: six per signal, seven for span completeness, at
-//     the client's 10s timeout each (datadog.go) — ~60s.
+//   - the Datadog submissions: at most six per signal, seven for span
+//     completeness, at the client's 10s timeout each (datadog.go) — ~60s. Fewer
+//     when a cycle is degraded: postBatchMetrics drops the three latency
+//     percentiles when nothing arrived and posts nothing at all when the batch
+//     could not be measured, so the worst case is the healthy case.
 //
 // So overlap is expected, and a skip points at slow Datadog submission or an
 // unusually slow Sentry Discover query, not at the send path. The cap exists so
@@ -322,6 +332,27 @@ func configFromEnv() (config, error) {
 		ddSite = "datadoghq.com"
 	}
 
+	// PROBE_BATCH_SIZE cannot exceed Sentry's per_page ceiling, because per_page
+	// is how the whole batch is retrieved. findBatch issues ONE request per poll
+	// and reads only result.Data — no pagination, no Link-header handling — with
+	// per_page set to the batch size, and Sentry documents per_page on the
+	// organization events endpoint as "Default and maximum allowed is 100".
+	//
+	// Past 100 there are two outcomes, and both corrupt the measurement silently:
+	// a 400, which leaves received at 0 and reads as Sentry losing the entire
+	// batch, or a server-side clamp to 100, which caps success_rate at
+	// 100/batchSize (a permanent 50% at a batch of 200) and looks like steady
+	// ingestion loss. Neither is distinguishable from a real Sentry problem in
+	// the metrics, and PROBE_BATCH_SIZE is presented as a free tunable in the
+	// README, .env.example and docker-compose.yml — so this fails at startup
+	// rather than shipping a plausible lie for weeks.
+	batchSize := envInt("PROBE_BATCH_SIZE", 100)
+	if batchSize > maxSentryPerPage {
+		return config{}, fmt.Errorf(
+			"PROBE_BATCH_SIZE is %d, which exceeds the maximum of %d: Sentry's events endpoint documents per_page as \"Default and maximum allowed is 100\", and the probe retrieves each batch in a single unpaginated request, so a larger batch cannot be measured",
+			batchSize, maxSentryPerPage)
+	}
+
 	return config{
 		sentryDSN:       required["SENTRY_DSN"],
 		sentryAuthToken: required["SENTRY_AUTH_TOKEN"],
@@ -332,7 +363,7 @@ func configFromEnv() (config, error) {
 		interval:        envDuration("PROBE_INTERVAL_SECONDS", 120),
 		pollTimeout:     envDuration("POLL_TIMEOUT_SECONDS", 120),
 		pollInterval:    envDuration("POLL_INTERVAL_SECONDS", 5),
-		batchSize:       envInt("PROBE_BATCH_SIZE", 100),
+		batchSize:       batchSize,
 		sendWindow:      envDuration("PROBE_SEND_WINDOW_SECONDS", 100),
 		spanSample:      envInt("SPAN_COMPLETENESS_SAMPLE", 20),
 	}, nil

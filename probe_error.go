@@ -22,9 +22,17 @@ func probeErrorBatch(ctx context.Context, s *sentryProbe, cfg config, batchID st
 		log.Printf("[error_ingestion] client: %v", err)
 		// sent counts sends that actually succeeded. Nothing left the process,
 		// so sent stays 0 — reporting cfg.batchSize here would read on the
-		// dashboard as Sentry dropping a full batch it never received.
+		// dashboard as Sentry dropping a full batch it never received. measured
+		// also stays false, which suppresses the cycle's metrics entirely: we
+		// never queried Sentry, so received=0 would be a fabrication.
 		return batchResult{}
 	}
+	// A sentry.Client owns a transport worker goroutine that exits only on
+	// Transport.Close(). This client is built per batch, so without this the
+	// process leaks 2 goroutines per cycle here — see runTraceBatch in probe.go
+	// for the arithmetic. Safe: runBatch joins every sender (and so every Flush)
+	// before returning, and the SDK guards Close with closeOnce.
+	defer client.Close()
 	send := func(ctx context.Context, seq int) (string, time.Time, error) {
 		// seqID is the batch's lookup key, so it must match byte-for-byte what
 		// findBatch reads out of the "probe_seq" field of a Discover row. That
@@ -38,9 +46,10 @@ func probeErrorBatch(ctx context.Context, s *sentryProbe, cfg config, batchID st
 		hub.Scope().SetTag("probe_batch", batchID)
 		hub.Scope().SetTag("probe_seq", seqID)
 		eventID := hub.CaptureMessage(fmt.Sprintf("SLO error probe batch %s seq %s", batchID, seqID))
-		// Stamp before the flush, like sendError: PROBE_BATCH_SIZE=1 must
-		// reproduce single-event behaviour, and a post-flush stamp would report
-		// a systematically smaller latency for the identical event. Flush also
+		// Stamp before the flush, as the retired single-event sender did:
+		// PROBE_BATCH_SIZE=1 must reproduce single-event behaviour, and a
+		// post-flush stamp would report a systematically smaller latency for the
+		// identical event. Flush also
 		// drains the whole shared client buffer, so a worker whose own event
 		// left immediately but whose Flush waits on a peer would stamp the
 		// peer's delay and under-report — optimistic exactly when Sentry is

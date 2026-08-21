@@ -10,14 +10,6 @@ import (
 	"github.com/getsentry/sentry-go"
 )
 
-// probeResult is the outcome of a single-event probe. Still used by probeAlert,
-// which measures alert-rule firing latency from one error event rather than a
-// batch.
-type probeResult struct {
-	traceID string
-	latency time.Duration
-}
-
 type sentryProbe struct {
 	dsn       string
 	authToken string
@@ -28,25 +20,6 @@ type sentryProbe struct {
 
 func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
 	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project, baseURL: "https://sentry.io"}
-}
-
-func (s *sentryProbe) sendError() (probeID string, sentAt time.Time, err error) {
-	client, clientErr := sentry.NewClient(sentry.ClientOptions{
-		Dsn:         s.dsn,
-		Environment: "probe",
-		Release:     "sentry-slo-probe@1.0.0",
-	})
-	if clientErr != nil {
-		return "", time.Time{}, fmt.Errorf("sentry client: %w", clientErr)
-	}
-
-	probeID = fmt.Sprintf("slo-probe-%d", time.Now().UnixNano())
-	hub := sentry.NewHub(client, sentry.NewScope())
-	hub.Scope().SetTag("probe_id", probeID)
-	hub.CaptureMessage("SLO error probe: " + probeID)
-	sentAt = time.Now()
-	client.Flush(10 * time.Second)
-	return probeID, sentAt, nil
 }
 
 // newTracingClient builds a client for transaction probes. EnableTracing is
@@ -160,9 +133,24 @@ func runTraceBatch(ctx context.Context, s *sentryProbe, cfg config, batchID, sig
 		log.Printf("%s client: %v", logPrefix, err)
 		// sent counts sends that actually succeeded. Nothing left the process,
 		// so sent stays 0 — reporting cfg.batchSize here would read on the
-		// dashboard as Sentry dropping a full batch it never received.
+		// dashboard as Sentry dropping a full batch it never received. measured
+		// also stays false, which suppresses the cycle's metrics entirely: we
+		// never queried Sentry, so received=0 would be a fabrication.
 		return batchResult{}
 	}
+	// A sentry.Client owns a transport worker goroutine that exits only on
+	// Transport.Close(). Measured against sentry-go v0.43.0: 50 unclosed clients
+	// leave +100 goroutines, 50 closed leave 0 — two per client.
+	//
+	// runTraceBatch is called twice a cycle (trace ingestion and span
+	// completeness), and probe_error.go builds a third client, so an unclosed
+	// client leaks 6 goroutines per cycle: ~4,320 a day at the 120s default, each
+	// pinning a 30-slot buffered channel and an http.Transport connection pool,
+	// growing without bound under `restart: unless-stopped`.
+	//
+	// Safe here: runBatch joins every sender before returning, so every Flush has
+	// already completed, and Close is guarded by the SDK's own closeOnce.
+	defer client.Close()
 	send := func(ctx context.Context, seq int) (string, time.Time, error) {
 		return sendTraceTagged(client, batchKey, seq, spans)
 	}
