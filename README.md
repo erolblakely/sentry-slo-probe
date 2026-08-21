@@ -35,20 +35,24 @@ An OpenTelemetry exporter to Datadog's agentless OTLP intake (`otlp.<DD_SITE>`) 
 
 Each cycle sends a batch of `PROBE_BATCH_SIZE` events per probe, so every signal reports a distribution and a success rate rather than one sample. For each signal in `ingestion` (traces), `error_ingestion`, and `span_completeness`:
 
-| Metric | Unit | Meaning |
-|---|---|---|
-| `sentry.<signal>.latency_ms.p50` | ms | Median send→queryable latency over the batch |
-| `sentry.<signal>.latency_ms.p95` | ms | p95 — the series the monitors alert on |
-| `sentry.<signal>.latency_ms.p99` | ms | p99 (a single event, at a batch size of 100) |
-| `sentry.<signal>.sent` | count | Events that left the process successfully |
-| `sentry.<signal>.received` | count | Events that came back queryable before the poll timeout |
-| `sentry.<signal>.success_rate` | % | `received / sent`, published as `0` when `sent` is `0` |
+| Metric | Unit | Datadog type | Meaning |
+|---|---|---|---|
+| `sentry.<signal>.latency_ms.p50` | ms | gauge | Median send→queryable latency over the batch |
+| `sentry.<signal>.latency_ms.p95` | ms | gauge | p95 — the series the monitors alert on |
+| `sentry.<signal>.latency_ms.p99` | ms | gauge | p99 (a single event, at a batch size of 100) |
+| `sentry.<signal>.sent` | count | **count** | Events that left the process successfully |
+| `sentry.<signal>.received` | count | **count** | Events that came back queryable before the poll timeout |
+| `sentry.<signal>.success_rate` | % | gauge | `received / sent`, published as `0` when `sent` is `0` |
 
 Plus one metric from the span probe alone:
 
-| Metric | Unit | Meaning |
-|---|---|---|
-| `sentry.span_completeness.received_pct` | % | Percentage of *sampled* transactions that arrived **complete** — all 5 child spans stored. **Not published at all** when the sample could not be taken — a gap in the series, rather than a fabricated `0%` that would read as total span loss. |
+| Metric | Unit | Datadog type | Meaning |
+|---|---|---|---|
+| `sentry.span_completeness.received_pct` | % | gauge | Percentage of *sampled* transactions that arrived **complete** — all 5 child spans stored. **Not published at all** when the sample could not be taken — a gap in the series, rather than a fabricated `0%` that would read as total span loss. |
+
+`sent` and `received` are submitted as Datadog **count** (type 1, with an `interval`) rather than gauges, because they are the numerator and denominator of the metric-based reliability SLOs and because two overlapping batches landing in one rollup bucket have to sum, not average. Everything else is a level and stays a gauge.
+
+**Two things are deliberately never published, and both are gaps you should not fill in.** The three latency percentiles are omitted for any cycle in which nothing arrived: there is no sample to take a percentile of, and the `0` an empty percentile returns would render a total ingestion failure as *perfect* latency — well under the alert thresholds, so the latency SLOs would sit at 100% straight through the outage. And *every* metric for a signal is withheld for a cycle in which the probe could not query Sentry at all — an expired `SENTRY_AUTH_TOKEN` is the observed case, where sends keep succeeding against the DSN while every Discover poll returns 401. `received` is not `0` there, it is unknown, and publishing `sent` without it would hand the reliability SLOs a denominator with no numerator. A cycle that publishes nothing contributes `0/0` and cannot move an SLO; the absence itself is what re-arms `notify_no_data` on the latency monitors. There is no heartbeat metric standing in for either case.
 
 Two things about `received_pct` matter before you put a threshold on it, and neither is obvious from the name.
 
@@ -122,11 +126,13 @@ Optional:
 | `PROBE_INTERVAL_SECONDS` | `120` | How often each probe starts a batch |
 | `POLL_TIMEOUT_SECONDS` | `120` | Give up waiting for the rest of a batch after this long |
 | `POLL_INTERVAL_SECONDS` | `5` | How often to poll — also the latency resolution |
-| `PROBE_BATCH_SIZE` | `100` | Events sent per probe per cycle |
+| `PROBE_BATCH_SIZE` | `100` | Events sent per probe per cycle. **100 is also the maximum**; a larger value is rejected at startup |
 | `PROBE_SEND_WINDOW_SECONDS` | `100` | Batch sends are paced evenly across this window rather than fired at once |
 | `SPAN_COMPLETENESS_SAMPLE` | `20` | How many arrived transactions go into the single span-count query |
 
-A batch is bounded at `PROBE_SEND_WINDOW_SECONDS + POLL_TIMEOUT_SECONDS + POLL_INTERVAL_SECONDS` (225s at defaults), which is longer than the 120s interval, so two batches per probe overlap in normal operation. That is expected.
+**`PROBE_BATCH_SIZE` cannot exceed 100.** Each batch is looked up with a single unpaginated Discover request, and Sentry documents `per_page` as "Default and maximum allowed is 100" — a larger batch would send events the probe then cannot see, and report them as dropped by Sentry. The process refuses to start rather than measure something it cannot measure, and `findBatch` clamps `per_page` at 100 defensively as well.
+
+A batch is bounded at `(PROBE_BATCH_SIZE - 1) / PROBE_BATCH_SIZE × PROBE_SEND_WINDOW_SECONDS + POLL_TIMEOUT_SECONDS + POLL_INTERVAL_SECONDS` (224s at defaults), which is longer than the 120s interval, so two batches per probe overlap in normal operation. That is expected. The first term is the *last scheduled send*, not the end of the send window: sends are paced at `window / size`, so the final one leaves one step before the window closes and its drain budget is measured from there. At `PROBE_BATCH_SIZE=1` that collapses to `POLL_TIMEOUT_SECONDS + POLL_INTERVAL_SECONDS`, matching what a single-event probe would take.
 
 A `skipping cycle` log line is not. It means a cycle outlived twice the interval (240s at defaults), which is past that ceiling. The send path is not what gets you there — its sends are paced across the window and bounded by a 10s flush timeout each. The work that can is what runs *after* the batch drains but still inside the same in-flight slot: the span probe's completeness census, exactly two Sentry Discover calls at a 10s timeout apiece (~20s, and flat in `SPAN_COMPLETENESS_SAMPLE`), and the six or seven Datadog submissions per signal, also 10s apiece (~60s). So a skip points at slow Datadog submission or an unusually slow Sentry Discover query, not at a slow send. Post-batch work no longer scales with the sample size, so skips should be rare.
 
@@ -168,11 +174,13 @@ Reliability **paging** is a separate path, and that is where the composites live
 
 Zero send errors, zero query errors, zero Datadog post errors, zero skipped cycles. The batch path is confirmed working: paced sends, batched polling, percentiles and success rates all arrive in Datadog.
 
-Use those numbers as a **reference baseline, not a guarantee**. Two cycles at batch size 10 is a first measurement, not a soak test — it says nothing about the tail beyond p95, about behaviour at the default batch size of 100, or about how any of this drifts over days.
+**Those p95 figures are not really p95s.** Percentiles are nearest-rank, so at a batch size of 10 both p95 and p99 resolve to `ceil(0.95 × 10) = ceil(0.99 × 10) = 10` — index 9, the largest of the ten samples. Each number above is the **maximum observed latency**, and p95 and p99 were identical. At the default `PROBE_BATCH_SIZE=100` p95 becomes a genuine 95th percentile and will read **lower** than these figures for the same underlying distribution, so do not read that drop as Sentry getting faster. The direction is safe for the thresholds derived from them — a threshold set off a maximum is conservative.
 
-This branch (`batched-slo-probes`) sends a paced batch of events per probe per cycle, and the batch path **is** wired into `main.go` — the legacy single-event path has been deleted. That is what turns the latency signal into real p50/p95/p99 percentiles plus a success rate rather than a single sample, and it is why the metric names in this README differ from the ones the released code emits.
+Use those numbers as a **reference baseline, not a guarantee**. Two cycles at batch size 10 is a first measurement, not a soak test — it says nothing about the tail beyond the maximum, about behaviour at the default batch size of 100, or about how any of this drifts over days.
 
-The `main` branch still runs **one synthetic event per probe per cycle** and still emits the pre-batch metric names, so any dashboards built against it need updating before this branch merges. The design and task plan live in `docs/`.
+The batch path **is** wired into `main.go` — the legacy single-event path and its alert-webhook probe have been deleted, so no single-event sender remains in the tree. That is what turns the latency signal into real p50/p95/p99 percentiles plus a success rate rather than a single sample.
+
+The batch rewrite is merged to `main`. If you have dashboards or monitors built against the pre-batch metric names, they need updating: the names changed, and Datadog will show them as permanently no-data rather than erroring. The design and task plan live in `docs/`.
 
 ## Layout
 
