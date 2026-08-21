@@ -111,10 +111,13 @@ func reportSpanCompleteness(dd *datadogClient, id string, res batchResult, pct f
 	dd.postBatchMetrics("span_completeness", res, baseTags)
 	if !known {
 		// known=false means the completeness sample is missing, not that no
-		// spans arrived: either the event-id lookup failed or no sampled event
-		// returned a span count. Publishing 0 would manufacture a total-failure
-		// reading out of an API hiccup, so the metric is suppressed for this
-		// cycle and the gap stays visible as a gap.
+		// spans arrived: the arrived-trace lookup failed, the span census
+		// failed, or nothing arrived to sample. A sampled trace merely absent
+		// from a *successful* census is not one of these — it genuinely stored
+		// no child spans, and probe_spans.go scores it incomplete. Publishing 0
+		// here would manufacture a total-failure reading out of an API hiccup,
+		// so the metric is suppressed for this cycle and the gap stays visible
+		// as a gap.
 		log.Printf("[span_completeness] batch=%s: completeness not measured this cycle, suppressing sentry.span_completeness.received_pct", id)
 		return
 	}
@@ -143,15 +146,24 @@ func reportSpanCompleteness(dd *datadogClient, id string, res batchResult, pct f
 // The reachable causes all sit *outside* runBatch but *inside* the in-flight
 // slot, because limiter.done() is deferred around the whole run(id) closure:
 //
-//   - span-completeness sampling: up to SPAN_COMPLETENESS_SAMPLE+1 sequential
-//     Sentry calls at the 10s sentryHTTP timeout (probe_spans.go,
-//     sentry_api.go) — ~210s at defaults, on top of runBatch's 225s;
+//   - span-completeness sampling: exactly two sequential Sentry calls at the
+//     10s sentryHTTP timeout (probe_spans.go, sentry_api.go) — one Discover
+//     query for the traces that arrived, one grouped count() census over the
+//     sample — so ~20s worst case, and flat in SPAN_COMPLETENESS_SAMPLE;
 //   - the Datadog submissions: six per signal, seven for span completeness, at
 //     the client's 10s timeout each (datadog.go) — ~60s.
 //
-// So overlap is expected, and a skip points at a slow Sentry event-detail API
-// or a slow Datadog, not at the send path. The cap exists so that neither can
-// grow the backlog without bound.
+// So overlap is expected, and a skip points at slow Datadog submission or an
+// unusually slow Sentry Discover query, not at the send path. The cap exists so
+// that neither can grow the backlog without bound.
+//
+// An observation, not a TODO: span-completeness sampling used to dominate this
+// arithmetic by a wide margin, because it scaled with the sample size. The
+// single census removed that term, leaving Datadog as the only substantial
+// out-of-runBatch cost, so skips should be markedly rarer than the cap was
+// sized for and a cap of 2 may now be over-provisioned. Raising or lowering it
+// is a behaviour change that wants its own measurement, and is deliberately not
+// made here.
 const maxInflightBatches = 2
 
 // inflightCap bounds concurrent in-flight batches for one probe type.
@@ -255,9 +267,11 @@ func runBatchLoop(name string, cfg config, runID string, limiter *inflightCap, w
 			// Two batches overlapping is normal (see maxInflightBatches); a skip
 			// is not. It means a batch has outlived 2x the interval, past the
 			// send+poll ceiling — which the send path cannot cause, so the message
-			// names the work that can: the post-batch Sentry sampling and Datadog
-			// submissions that also run inside the in-flight slot.
-			log.Printf("[%s] skipping cycle %d (batch=%s): %d batches still draining, at in-flight cap — a batch has outlived %s (2x the %s interval), past the send+poll ceiling: check the Sentry event-detail API (span-completeness sampling) and Datadog submission latency, which run inside the slot after the batch drains",
+			// names the work that can: the post-batch Sentry census and Datadog
+			// submissions that also run inside the in-flight slot. Datadog is the
+			// larger of the two now that the census is two calls rather than one
+			// per sampled event, so it is named first.
+			log.Printf("[%s] skipping cycle %d (batch=%s): %d batches still draining, at in-flight cap — a batch has outlived %s (2x the %s interval), past the send+poll ceiling: check Datadog submission latency and the two Sentry Discover queries (span-completeness census), which run inside the slot after the batch drains",
 				name, cycle, id, limiter.max, 2*cfg.interval, cfg.interval)
 			return
 		}

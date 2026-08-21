@@ -78,8 +78,21 @@
 #   The probe should already be running so these metrics exist in Datadog.
 #
 # NOTE: This does NOT upsert — re-running creates duplicates. Delete the old
-# monitors/SLOs first if you need to re-run. Thresholds/targets below are
-# sensible starting points; tune them to your real ingestion behavior.
+# monitors/SLOs first if you need to re-run.
+#
+# THE LATENCY THRESHOLDS BELOW ARE NO LONGER GUESSES. They are set against a
+# live baseline measured on 2026-08-20 — two clean cycles at
+# PROBE_BATCH_SIZE=10, 10/10 received on every probe, zero send errors, zero
+# query errors, zero Datadog post errors, zero skips:
+#
+#   error_ingestion      p50 11.204s   p95 16.261s
+#   ingestion (trace)    p50 57.122s   p95 66.129s
+#   span_completeness    received_pct 100%
+#
+# Each latency threshold below carries a comment saying how it stands against
+# that baseline and whether it is meant to be tuned. Two cycles is a baseline,
+# not a soak test — read those comments before changing a number, and re-check
+# all of them against a few days of your own org's data.
 
 set -euo pipefail
 
@@ -129,16 +142,38 @@ echo "==> Creating monitors on api.${DD_SITE}"
 # Latency: p95 is the alerting series. The tag is probe:ingestion — the trace
 # signal is named "ingestion" in the code, so probe:trace_ingestion matches
 # nothing and would leave this monitor silently no-data.
+#
+# 120000 is roughly 2x the observed p95. Measured baseline 2026-08-20, two
+# clean 10/10 cycles at PROBE_BATCH_SIZE=10: p50 57.122s, p95 66.129s.
+#
+# DO NOT COMPARE THIS THRESHOLD TO THE ERROR ONE BELOW. Transactions become
+# queryable in the spans dataset far more slowly than errors do — about 4x at
+# p95 (66.1s vs 16.3s) and 5x at p50 (57.1s vs 11.2s) — so they measure different
+# physics and the gap between them is not slack to be tidied away. This monitor
+# was previously 60000, i.e. *below* the healthy observed p95, so it would have
+# sat in ALERT continuously against a fully working system.
 M_TRACE=$(create_monitor '{
   "name": "Sentry trace ingestion latency (SLO source)",
   "type": "metric alert",
-  "query": "avg(last_5m):avg:sentry.ingestion.latency_ms.p95{'"${SCOPE}"',probe:ingestion} > 60000",
-  "message": "p95 of a synthetic trace batch took > 60s to become queryable in Sentry.",
+  "query": "avg(last_5m):avg:sentry.ingestion.latency_ms.p95{'"${SCOPE}"',probe:ingestion} > 120000",
+  "message": "p95 of a synthetic trace batch took > 120s to become queryable in Sentry. Healthy observed p95 is ~66s (baseline measured 2026-08-20 at batch size 10); traces are inherently slower to become queryable than errors.",
   "tags": ["service:sentry-slo-probe","probe:ingestion"],
-  "options": {"thresholds": {"critical": 60000}, "notify_no_data": true, "no_data_timeframe": 15, "renotify_interval": 0}
+  "options": {"thresholds": {"critical": 120000}, "notify_no_data": true, "no_data_timeframe": 15, "renotify_interval": 0}
 }')
 echo "  trace-ingestion-latency monitor:   ${M_TRACE}"
 
+# 90000 is DELIBERATELY LOOSE AND IS DELIBERATELY LEFT LOOSE, pending more data.
+# Measured baseline 2026-08-20, two clean 10/10 cycles at PROBE_BATCH_SIZE=10:
+# p50 11.204s, p95 16.261s — so this threshold carries roughly 5.5x slack over
+# the observed p95.
+#
+# That slack is not an oversight and it was not tightened when the baseline
+# landed. Two cycles is one observation of the tail, and tightening a threshold
+# that is not firing toward a single observation manufactures false alerts,
+# whereas raising a demonstrably-broken threshold (see the trace monitor above,
+# which sat below its own healthy p95) cannot. The numbers are recorded here so
+# that whoever tunes this against a few days of real data starts from a measured
+# value rather than a guess.
 M_ERROR=$(create_monitor '{
   "name": "Sentry error ingestion latency (SLO source)",
   "type": "metric alert",
@@ -164,9 +199,14 @@ echo "  error-ingestion-latency monitor:   ${M_ERROR}"
 # would mean "tolerate N% of transactions losing spans", not "tolerate N% span
 # loss". And because it is a sample rather than a census, a single sampled
 # transaction is worth 1/sample of the reading (5 points at the default 20), so
-# the series is coarse by construction. Fetches that fail shrink the sample
-# instead of scoring as incomplete, and a cycle whose sample could not be taken
-# at all publishes nothing rather than 0.
+# the series is coarse by construction.
+#
+# The census behind it is ONE grouped count() query over the spans dataset for
+# the whole sample, not a fetch per transaction, so there is no per-transaction
+# failure left to shrink the sample. Either the query succeeds — in which case a
+# sampled transaction absent from the results genuinely stored no child spans
+# and scores as incomplete — or it fails outright and the cycle publishes
+# nothing rather than 0.
 #
 # The metric name is fixed and must not change; the meaning is the one above.
 M_SPANS=$(create_monitor '{
@@ -284,7 +324,7 @@ echo "==> Creating SLOs (30-day rolling window)"
 S1=$(create_slo '{
   "type": "monitor",
   "name": "Sentry trace ingestion latency",
-  "description": "99% of the time, the p95 of a synthetic trace batch is queryable in Sentry within 60s. This is a batch percentile, not a per-event guarantee: the slowest 5% of a batch can exceed 60s without the monitor firing.",
+  "description": "99% of the time, the p95 of a synthetic trace batch is queryable in Sentry within 120s. This is a batch percentile, not a per-event guarantee: the slowest 5% of a batch can exceed 120s without the monitor firing. 120s is ~2x the observed healthy p95 of 66s (baseline 2026-08-20); traces become queryable far more slowly than errors, so this target is not comparable to the error latency SLO.",
   "monitor_ids": ['"${M_TRACE}"'],
   "thresholds": [{"timeframe": "30d", "target": 99.0, "warning": 99.5}],
   "tags": '"${TAGS}"'
