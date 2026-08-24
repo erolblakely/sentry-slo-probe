@@ -32,6 +32,30 @@ func (e *apiError) Error() string {
 // dataset=errors, which is still populated.
 const traceDataset = "spans"
 
+// maxSentryPerPage is the ceiling Sentry documents for per_page on the
+// organization events endpoint: "Default and maximum allowed is 100".
+//
+// It is load-bearing rather than cosmetic. These queries are single, unpaginated
+// requests — result.Data only, no Link-header walk — so per_page is not a page
+// size, it is the entire retrieval capacity. configFromEnv rejects a
+// PROBE_BATCH_SIZE above this so an operator hears about it at startup;
+// clampPerPage is the second line of defence at the request itself.
+const maxSentryPerPage = 100
+
+// clampPerPage keeps per_page inside [1, maxSentryPerPage]. Out-of-range values
+// are worse than useless here: Sentry rejects the request, and a rejected query
+// returns no rows, which the probe would otherwise be reading as "Sentry
+// ingested nothing" — a fabricated total failure caused by our own bad request.
+func clampPerPage(limit int) int {
+	if limit > maxSentryPerPage {
+		return maxSentryPerPage
+	}
+	if limit < 1 {
+		return 1
+	}
+	return limit
+}
+
 // findBatch queries Discover for events tagged probe_batch:batchID and returns
 // the set of distinct idField values seen. One request covers the whole batch,
 // so polling cost stays constant no matter how many events a cycle sends.
@@ -41,7 +65,7 @@ func (s *sentryProbe) findBatch(dataset, batchID, idField string, limit int) (ma
 	q.Set("statsPeriod", "1h")
 	q.Set("query", fmt.Sprintf("probe_batch:%s", batchID))
 	q.Set("field", idField)
-	q.Set("per_page", strconv.Itoa(limit))
+	q.Set("per_page", strconv.Itoa(clampPerPage(limit)))
 
 	endpoint := fmt.Sprintf("%s/api/0/organizations/%s/events/?%s",
 		s.baseURL, url.PathEscape(s.org), q.Encode())
@@ -96,7 +120,11 @@ func (s *sentryProbe) findBatchSpanCounts(traceIDs []string, limit int) (map[str
 	q.Set("query", fmt.Sprintf("trace:[%s] is_transaction:false", strings.Join(traceIDs, ",")))
 	q.Set("field", "trace")
 	q.Add("field", "count()")
-	q.Set("per_page", strconv.Itoa(limit))
+	// Same endpoint, same documented ceiling. Today limit is len(traceIDs), which
+	// the arrived set already bounds below 100, so this cannot bite — it is here
+	// so that a future caller passing a larger bound cannot turn a 400 into an
+	// apparent census of zero spans.
+	q.Set("per_page", strconv.Itoa(clampPerPage(limit)))
 
 	endpoint := fmt.Sprintf("%s/api/0/organizations/%s/events/?%s",
 		s.baseURL, url.PathEscape(s.org), q.Encode())

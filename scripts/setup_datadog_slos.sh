@@ -8,12 +8,43 @@
 # The probe sends a paced *batch* of synthetic events per cycle, so for each
 # signal in {ingestion, error_ingestion, span_completeness} it emits:
 #
-#   sentry.<signal>.latency_ms.p50        (batch latency percentiles, ms)
+#   sentry.<signal>.latency_ms.p50        (batch latency percentiles, ms; GAUGE)
 #   sentry.<signal>.latency_ms.p95
 #   sentry.<signal>.latency_ms.p99
-#   sentry.<signal>.sent                  (events that left the process)
-#   sentry.<signal>.received              (events that came back queryable)
-#   sentry.<signal>.success_rate          (received/sent as a %; 0 when sent==0)
+#   sentry.<signal>.sent                  (events that left the process; COUNT)
+#   sentry.<signal>.received              (events that came back queryable; COUNT)
+#   sentry.<signal>.success_rate          (received/sent as a %; 0 when sent==0;
+#                                          GAUGE)
+#
+# METRIC TYPES ARE PART OF THE CONTRACT. .sent and .received are submitted as
+# Datadog COUNT (type 1) with an interval, because they are the numerator and
+# denominator of the metric-based SLOs S4/S5/S6 below and Datadog supports COUNT,
+# RATE and percentile-enabled DISTRIBUTION there. They were gauges once; that was
+# a defect, not a choice — gauge rollup defaults to avg, and two overlapping
+# batches in one bucket must SUM (overlap is the healthy steady state). The
+# percentiles and success_rate stay GAUGE (type 3) on purpose: they are levels,
+# and the monitor-based SLOs over them are correct that way.
+#
+# TWO WAYS A SERIES CAN BE ABSENT, AND BOTH ARE DELIBERATE.
+#
+#   * The three latency percentiles are NOT published when a cycle received
+#     nothing, because there is no latency sample to take a percentile of.
+#     Publishing the 0 that an empty percentile returns would render a total
+#     ingestion failure as PERFECT latency — 0 never crosses the > 120000 /
+#     > 90000 thresholds below, so the latency SLOs would sit at 100% through an
+#     outage. The gap is the signal: notify_no_data (15m, set on both monitors)
+#     is armed by an absent series and disabled by a fabricated one.
+#
+#   * ALL of a signal's metrics are withheld for a cycle in which the probe
+#     could not query Sentry at all — an expired SENTRY_AUTH_TOKEN being the
+#     observed case, where sends succeed against the DSN and every Discover poll
+#     returns 401. received is not zero then, it is unknown, and sent without
+#     received would give the metric-based SLOs a denominator with no numerator:
+#     a 0% ratio, i.e. a worse false breach than publishing nothing. A cycle that
+#     publishes nothing contributes 0/0 and cannot move the SLO, which is the
+#     same structural immunity described under the reliability SLOs below.
+#     There is no separate heartbeat metric; "the probe cannot measure" surfaces
+#     as the sent>0 gate going quiet plus notify_no_data on the latency monitors.
 #
 # and, from the span probe only:
 #
@@ -89,6 +120,17 @@
 #   ingestion (trace)    p50 57.122s   p95 66.129s
 #   span_completeness    received_pct 100%
 #
+# READ THIS BEFORE TREATING THOSE p95 FIGURES AS p95s. The probe takes
+# nearest-rank percentiles, so at the batch size of 10 those runs used,
+# ceil(0.95 x 10) = ceil(0.99 x 10) = 10 — index 9, the largest sample. The p95
+# and p99 above are therefore the same number as each other and both are the
+# MAXIMUM of 10 observations, not a 95th percentile. At the production default
+# of PROBE_BATCH_SIZE=100 p95 becomes a genuine 95th percentile and will read
+# LOWER than these figures for the same underlying distribution. The direction is
+# safe — a threshold set off a maximum is conservative, so nothing below is
+# mis-set — but do not read a drop after raising the batch size as an improvement
+# in Sentry.
+#
 # Each latency threshold below carries a comment saying how it stands against
 # that baseline and whether it is meant to be tuned. Two cycles is a baseline,
 # not a soak test — read those comments before changing a number, and re-check
@@ -144,7 +186,11 @@ echo "==> Creating monitors on api.${DD_SITE}"
 # nothing and would leave this monitor silently no-data.
 #
 # 120000 is roughly 2x the observed p95. Measured baseline 2026-08-20, two
-# clean 10/10 cycles at PROBE_BATCH_SIZE=10: p50 57.122s, p95 66.129s.
+# clean 10/10 cycles at PROBE_BATCH_SIZE=10: p50 57.122s, p95 66.129s. At batch
+# size 10 that "p95" is arithmetically the maximum of the 10 samples (nearest
+# rank puts p95 and p99 on the same index), so this threshold is set off a max
+# and is conservative; at the default batch size of 100 the p95 series will read
+# lower for the same distribution. See the baseline block at the top.
 #
 # DO NOT COMPARE THIS THRESHOLD TO THE ERROR ONE BELOW. Transactions become
 # queryable in the spans dataset far more slowly than errors do — about 4x at
@@ -261,6 +307,21 @@ echo "  span-completeness monitor:         ${M_SPANS}"
 # different alert from "Sentry is dropping our events", and the latency
 # monitors' notify_no_data already covers the first.
 #
+# A cycle the probe could not MEASURE (no Discover query succeeded — expired
+# SENTRY_AUTH_TOKEN, endpoint down) publishes no sentry.<signal>.* series at all,
+# not even sent. So it lands in the same place as "not running": B goes to
+# no-data -> 0, the gate closes, C stays quiet, and the latency monitors'
+# notify_no_data raises the real alarm. That is the intended routing — we must
+# never page "Sentry is dropping events" on our own inability to look.
+#
+# B's aggregators are chosen for a COUNT metric. sum:, not avg:, across space
+# because two probe instances under one scope must total rather than average
+# (avg: would let a live instance mask a dead one, and S4/S5/S6 below already
+# use sum:). sum over the window, not avg, because the honest question is "how
+# many events did we send in the last 10 minutes", and averaging a count across
+# rollup buckets — most of which are empty at a 120s submission cadence — is an
+# arbitrary number that happens to be positive rather than a meaningful one.
+#
 # create_reliability_monitor <metric signal> <probe tag> <threshold %> <label>
 # Prints the composite monitor id on stdout; progress goes to stderr, because
 # the caller captures stdout.
@@ -286,7 +347,7 @@ create_reliability_monitor() {
   m_sent=$(create_monitor '{
   "name": "Sentry '"${label}"' sent>0 gate (alert part B of composite — DO NOT PAGE)",
   "type": "metric alert",
-  "query": "avg(last_10m):default_zero(avg:sentry.'"${signal}"'.sent{'"${SCOPE}"',probe:'"${probe_tag}"'}) > 0",
+  "query": "sum(last_10m):default_zero(sum:sentry.'"${signal}"'.sent{'"${SCOPE}"',probe:'"${probe_tag}"'}) > 0",
   "message": "Gate only. ALERTING here is the NORMAL, HEALTHY state: it means the probe is successfully sending '"${label}"' events. Consumed by a composite monitor so a local send failure cannot be reported as a Sentry breach. Do not route notifications off this monitor and do not delete it without deleting its composite.",
   "tags": ["service:sentry-slo-probe","probe:'"${probe_tag}"'","slo-part:sent-gate"],
   "options": {"thresholds": {"critical": 0}, "notify_no_data": false, "renotify_interval": 0}
@@ -383,15 +444,21 @@ echo "  SLO span completeness:             ${S3}"
 # Targets match the paging composites' 99% threshold on purpose, so the alert
 # and the SLO encode one intent rather than drifting apart.
 #
-# ONE THING TO CHECK ON THE FIRST REAL RUN. Datadog documents metric-based SLOs
-# as supporting COUNT, RATE and percentile-enabled DISTRIBUTION metrics. The
-# probe submits every metric as a gauge ("type": 3 in datadog.go's postMetric),
-# including .sent and .received, which are semantically counts but are not
-# typed as such. If Datadog rejects these three /slo calls, or accepts them and
-# the resulting SLI looks wrong, the fix is in the probe rather than here:
-# submit .sent and .received with the count type and leave these queries alone.
+# METRIC TYPES. Datadog documents metric-based SLOs as supporting COUNT, RATE
+# and percentile-enabled DISTRIBUTION metrics. .sent and .received are submitted
+# as COUNT (type 1, with an interval) by datadog.go's postBatchMetrics precisely
+# so these three queries are well-formed; the earlier gauge typing was a defect
+# that risked rejection here and, if accepted, an avg time-rollup where two
+# overlapping batches in one bucket must sum. Do not "simplify" the probe back
+# to a single metric type without revisiting these queries.
+#
 # create_slo prints the API error and exits non-zero, so a rejection is loud
 # rather than a half-configured SLO.
+#
+# A cycle the probe could not measure publishes neither numerator nor
+# denominator (see postBatchMetrics), so it contributes 0/0 and cannot breach
+# these SLOs. That is the same structural immunity the "sent nothing" case
+# relies on, extended to "could not look".
 S4=$(create_slo '{
   "type": "metric",
   "name": "Sentry trace ingestion reliability",

@@ -44,10 +44,28 @@ func sendOffsets(size int, window time.Duration) []time.Duration {
 }
 
 // batchResult is the outcome of one batch run.
+//
+// measured is the measurement-validity bit, and it is what separates "Sentry
+// dropped our events" from "we could not look". received is only a numerator
+// when we actually managed to ask Sentry what arrived: sends authenticate with
+// the DSN while queries authenticate with SENTRY_AUTH_TOKEN, so an expired token
+// yields sent=N, received=0 and a 0% success_rate that blames Sentry for our own
+// credential failure. That is not hypothetical — a live run produced 21 x
+// "401 Invalid token" with all three probes at received=0/N.
+//
+// It is false by default, which is the safe direction: the early
+// `return batchResult{}` paths in runTraceBatch and probeErrorBatch (client
+// construction failed, nothing was sent and nothing was queried) leave it false
+// for free, so one predicate covers both failure classes. runBatch sets it true
+// on the first query() that returns a nil error.
+//
+// A false measured must suppress the WHOLE signal for the cycle, not just
+// received — see postBatchMetrics.
 type batchResult struct {
 	sent      int
 	received  int
 	latencies []time.Duration
+	measured  bool
 }
 
 // latencyTracker records per-id send times and, on each poll, the latency of
@@ -144,6 +162,17 @@ func batchConfigFrom(cfg config) batchConfig {
 func runBatch(ctx context.Context, cfg batchConfig, send sendFunc, query queryFunc) batchResult {
 	tracker := newLatencyTracker()
 	var mu sync.Mutex
+	// measured is guarded by mu alongside the tracker: it is written in the poll
+	// loop and read at both return sites. See batchResult.measured for why the
+	// bit exists; one successful query is enough, because it establishes that we
+	// were able to ask Sentry at all.
+	measured := false
+	// finish builds the result. Callers must hold mu.
+	finish := func() batchResult {
+		res := tracker.result(tracker.sentCount())
+		res.measured = measured
+		return res
+	}
 	offsets := sendOffsets(cfg.size, cfg.sendWindow)
 	start := time.Now()
 
@@ -183,7 +212,24 @@ func runBatch(ctx context.Context, cfg batchConfig, send sendFunc, query queryFu
 		wg.Wait()
 	}()
 
-	lastSendAt := start.Add(cfg.sendWindow)
+	// The drain deadline is measured from the last SCHEDULED send, not from the
+	// nominal end of the send window. sendOffsets spaces size sends at
+	// window/size, so the final one leaves at (size-1)/size * window — the window
+	// end is a time at which nothing is sent.
+	//
+	// Anchoring to the window end padded every batch by one step and broke the
+	// small end outright: at PROBE_BATCH_SIZE=1 the only send happens at t=0, yet
+	// polling ran to sendWindow+pollTimeout (~220s at defaults) rather than the
+	// ~120s the single-event path took. At size 100 the same slack works the
+	// other way, letting the sender run past the window and eat into the tail
+	// events' drain budget — biasing received DOWN exactly when Sentry is slow.
+	//
+	// offsets is nil for size <= 0 (sendOffsets), so the deadline collapses to
+	// start+pollTimeout and the run terminates rather than indexing a nil slice.
+	lastSendAt := start
+	if len(offsets) > 0 {
+		lastSendAt = start.Add(offsets[len(offsets)-1])
+	}
 	ticker := time.NewTicker(cfg.pollInterval)
 	defer ticker.Stop()
 	for {
@@ -192,7 +238,7 @@ func runBatch(ctx context.Context, cfg batchConfig, send sendFunc, query queryFu
 			<-sendDone
 			mu.Lock()
 			defer mu.Unlock()
-			return tracker.result(tracker.sentCount())
+			return finish()
 		case <-ticker.C:
 			found, err := query(ctx)
 			now := time.Now()
@@ -200,6 +246,11 @@ func runBatch(ctx context.Context, cfg batchConfig, send sendFunc, query queryFu
 			if err != nil {
 				log.Printf("[batch] query: %v", err)
 			} else {
+				// One nil error is all it takes: it proves the credentials and
+				// the endpoint worked, so received is a real numerator for this
+				// cycle. A later transient failure must not retract a
+				// measurement we did make.
+				measured = true
 				tracker.observe(found, now)
 			}
 			received := tracker.receivedCount()
@@ -211,7 +262,7 @@ func runBatch(ctx context.Context, cfg batchConfig, send sendFunc, query queryFu
 				<-sendDone
 				mu.Lock()
 				defer mu.Unlock()
-				return tracker.result(tracker.sentCount())
+				return finish()
 			}
 		}
 	}

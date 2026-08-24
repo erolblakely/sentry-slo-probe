@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -162,6 +163,81 @@ func TestRunBatchAllArrive(t *testing.T) {
 	if res.sent != 5 || res.received != 5 || len(res.latencies) != 5 {
 		t.Fatalf("result = %+v, want sent=received=5", res)
 	}
+	if !res.measured {
+		t.Error("measured = false after successful queries; the cycle's metrics would be suppressed")
+	}
+}
+
+// TestRunBatchQueryAlwaysFailsIsNotMeasured is the expired-auth-token scenario,
+// and the reason batchResult carries a validity bit at all. Sends authenticate
+// with the DSN and succeed; every query authenticates with SENTRY_AUTH_TOKEN and
+// returns 401. Without the bit that reads out as sent=N, received=0 →
+// success_rate 0% — a confident false accusation against Sentry for our own
+// credential failure. This was reproduced live: 21 x "401 Invalid token".
+//
+// sent must still be honest (the events really did leave), but measured must be
+// false so the reporting layer suppresses the whole signal for the cycle.
+func TestRunBatchQueryAlwaysFailsIsNotMeasured(t *testing.T) {
+	cfg := batchConfig{
+		size: 3, sendWindow: 10 * time.Millisecond,
+		pollTimeout: 30 * time.Millisecond, pollInterval: 5 * time.Millisecond,
+		sendWorkers: 2,
+	}
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		return "e" + strconv.Itoa(seq), time.Now(), nil
+	}
+	var calls int64
+	query := func(ctx context.Context) (map[string]bool, error) {
+		atomic.AddInt64(&calls, 1)
+		return nil, errUnauthorized
+	}
+
+	res := runBatch(context.Background(), cfg, send, query)
+
+	if atomic.LoadInt64(&calls) == 0 {
+		t.Fatal("query never called; the test proves nothing")
+	}
+	if res.measured {
+		t.Error("measured = true although every query failed: an unmeasurable cycle would publish received=0 and read as a Sentry outage")
+	}
+	if res.sent != 3 {
+		t.Errorf("sent = %d, want 3: the sends genuinely succeeded and must stay honest", res.sent)
+	}
+	if res.received != 0 {
+		t.Errorf("received = %d, want 0", res.received)
+	}
+}
+
+// TestRunBatchMeasuredOnAnySuccessfulQuery: one good poll is enough. A single
+// transient 500 in the middle of an otherwise healthy cycle must not throw away
+// a measurement we did make — the bit means "we managed to ask", not "every ask
+// worked".
+func TestRunBatchMeasuredOnAnySuccessfulQuery(t *testing.T) {
+	cfg := batchConfig{
+		size: 1, sendWindow: 5 * time.Millisecond,
+		pollTimeout: 60 * time.Millisecond, pollInterval: 5 * time.Millisecond,
+		sendWorkers: 1,
+	}
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		return "only", time.Now(), nil
+	}
+	var calls int64
+	query := func(ctx context.Context) (map[string]bool, error) {
+		// Fail the first poll, succeed afterwards.
+		if atomic.AddInt64(&calls, 1) == 1 {
+			return nil, errUnauthorized
+		}
+		return map[string]bool{"only": true}, nil
+	}
+
+	res := runBatch(context.Background(), cfg, send, query)
+
+	if !res.measured {
+		t.Error("measured = false although a later query succeeded")
+	}
+	if res.received != 1 {
+		t.Errorf("received = %d, want 1", res.received)
+	}
 }
 
 func TestRunBatchTimeoutNoneArrive(t *testing.T) {
@@ -171,8 +247,12 @@ func TestRunBatchTimeoutNoneArrive(t *testing.T) {
 		sendWorkers: 2,
 	}
 	var calls int64
+	// Per-seq ids, not a constant. A constant "x" collapses every send into one
+	// sentAt entry, so this exercised the markSent-overwrite path with sent=1
+	// rather than a three-send batch, and the sent assertion below could not have
+	// caught a regression in the denominator.
 	send := func(ctx context.Context, seq int) (string, time.Time, error) {
-		return "x", time.Now(), nil
+		return "x" + strconv.Itoa(seq), time.Now(), nil
 	}
 	query := func(ctx context.Context) (map[string]bool, error) {
 		atomic.AddInt64(&calls, 1)
@@ -180,8 +260,17 @@ func TestRunBatchTimeoutNoneArrive(t *testing.T) {
 	}
 	start := time.Now()
 	res := runBatch(context.Background(), cfg, send, query)
+	if res.sent != 3 {
+		t.Fatalf("sent = %d, want 3 (one entry per seq)", res.sent)
+	}
 	if res.received != 0 {
 		t.Fatalf("received = %d, want 0", res.received)
+	}
+	// The queries all succeeded and honestly reported an empty Sentry. That is a
+	// real 0% breach and must be published, which is exactly what distinguishes
+	// it from TestRunBatchQueryAlwaysFailsIsNotMeasured.
+	if !res.measured {
+		t.Error("measured = false although every query succeeded; a genuine total loss must still burn error budget")
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("runBatch took %s, expected to stop near drain deadline", elapsed)
@@ -191,9 +280,88 @@ func TestRunBatchTimeoutNoneArrive(t *testing.T) {
 	}
 }
 
+// TestRunBatchDrainDeadlineAnchoredToLastScheduledSend pins what the drain
+// deadline is measured from: the last SCHEDULED send offset, not the nominal end
+// of the send window.
+//
+// At PROBE_BATCH_SIZE=1 the only send happens at t=0, so the batch should stop
+// about pollTimeout later. Anchoring to start+sendWindow instead makes it poll
+// for sendWindow+pollTimeout — at production defaults that is ~220s of polling
+// for an event sent at t=0, against the 120s the single-event path used to take.
+//
+// The same anchor matters at full size for the opposite reason: the last event
+// is scheduled at (size-1)/size * window, and giving it exactly pollTimeout from
+// there is what stops the tail's drain budget from being quietly padded.
+//
+// Timings are deliberately far apart (200ms window vs 40ms timeout) so the two
+// behaviours cannot be confused by scheduler jitter.
+func TestRunBatchDrainDeadlineAnchoredToLastScheduledSend(t *testing.T) {
+	cfg := batchConfig{
+		size: 1, sendWindow: 200 * time.Millisecond,
+		pollTimeout: 40 * time.Millisecond, pollInterval: 5 * time.Millisecond,
+		sendWorkers: 1,
+	}
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		return "only", time.Now(), nil
+	}
+	query := func(ctx context.Context) (map[string]bool, error) {
+		return map[string]bool{}, nil // never arrives
+	}
+
+	start := time.Now()
+	res := runBatch(context.Background(), cfg, send, query)
+	elapsed := time.Since(start)
+
+	if res.received != 0 {
+		t.Fatalf("received = %d, want 0", res.received)
+	}
+	// Generous ceiling: the honest bound is ~45ms, the buggy one ~245ms.
+	if elapsed > 150*time.Millisecond {
+		t.Errorf("runBatch took %s for a single send at t=0 with a %s poll timeout; the drain deadline is anchored to the nominal window end (%s) instead of the last scheduled send",
+			elapsed, cfg.pollTimeout, cfg.sendWindow)
+	}
+	if elapsed < cfg.pollTimeout {
+		t.Errorf("runBatch took %s, less than the %s poll timeout: the event was not given its full drain budget", elapsed, cfg.pollTimeout)
+	}
+}
+
+// TestRunBatchZeroSizeTerminates guards the empty-offsets case the anchoring
+// change has to handle: sendOffsets returns nil for size <= 0, so indexing the
+// last offset unguarded would panic.
+func TestRunBatchZeroSizeTerminates(t *testing.T) {
+	cfg := batchConfig{
+		size: 0, sendWindow: 10 * time.Millisecond,
+		pollTimeout: 20 * time.Millisecond, pollInterval: 5 * time.Millisecond,
+		sendWorkers: 1,
+	}
+	send := func(ctx context.Context, seq int) (string, time.Time, error) {
+		t.Error("send called for a zero-size batch")
+		return "", time.Time{}, nil
+	}
+	query := func(ctx context.Context) (map[string]bool, error) {
+		return map[string]bool{}, nil
+	}
+
+	done := make(chan batchResult, 1)
+	go func() { done <- runBatch(context.Background(), cfg, send, query) }()
+	select {
+	case res := <-done:
+		if res.sent != 0 || res.received != 0 {
+			t.Errorf("result = %+v, want an empty batch", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runBatch did not terminate for size 0")
+	}
+}
+
 // errSendFailed stands in for a local send failure (network blip, transport
 // error) in tests -- the class of failure that must not be blamed on Sentry.
 var errSendFailed = errors.New("send failed")
+
+// errUnauthorized stands in for the Sentry Discover API rejecting our auth
+// token. Sends keep working (they use the DSN), so this is the failure that
+// makes received meaningless while sent stays real.
+var errUnauthorized = errors.New("sentry api 401: Invalid token")
 
 // TestRunBatchFailedSendsExcludedFromSent pins the rule that res.sent counts
 // only sends that succeeded, so success_rate = received/sent measures Sentry's

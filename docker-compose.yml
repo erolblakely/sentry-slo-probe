@@ -18,6 +18,9 @@ services:
       PROBE_INTERVAL_SECONDS: "${PROBE_INTERVAL_SECONDS:-120}"
       POLL_TIMEOUT_SECONDS: "${POLL_TIMEOUT_SECONDS:-120}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-5}"
+      # 100 is the default AND the maximum: a batch is looked up in one
+      # unpaginated Discover request and Sentry caps per_page at 100, so the
+      # probe exits at startup rather than send events it cannot then see.
       PROBE_BATCH_SIZE: "${PROBE_BATCH_SIZE:-100}"
       PROBE_SEND_WINDOW_SECONDS: "${PROBE_SEND_WINDOW_SECONDS:-100}"
       SPAN_COMPLETENESS_SAMPLE: "${SPAN_COMPLETENESS_SAMPLE:-20}"
