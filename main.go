@@ -49,11 +49,31 @@ func main() {
 	// wrote it.
 	runID := newRunID(time.Now())
 
-	log.Printf("Starting SLO probes (run=%s, interval=%s, batch=%d, send_window=%s, poll_timeout=%s, max_inflight=%d)",
-		runID, cfg.interval, cfg.batchSize, cfg.sendWindow, cfg.pollTimeout, maxInflightBatches)
+	log.Printf("Starting SLO probes (run=%s, interval=%s, batch=%d, send_window=%s, poll_timeout=%s, max_inflight=%d, trace_stream=%t, trace_stream_otlp=%t)",
+		runID, cfg.interval, cfg.batchSize, cfg.sendWindow, cfg.pollTimeout, maxInflightBatches, cfg.streamEnabled, cfg.streamOTLPEnabled)
 
 	var wg sync.WaitGroup
 	wg.Add(3)
+
+	// Probe 4: the continuous trace stream, one trace a second (stream.go). If
+	// its Sentry client cannot be built it returns, and the batch probes carry on.
+	if cfg.streamEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runTraceStreamProbe(ctx, s, cfg, runID, baseTags)
+		}()
+	}
+
+	// Probe 5: the same stream over OpenTelemetry/OTLP (otlp.go), a separate
+	// Sentry ingest path, side by side with probe 4 for comparison.
+	if cfg.streamOTLPEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runOTLPStreamProbe(ctx, s, cfg, runID, baseTags)
+		}()
+	}
 
 	// Each probe signal gets its own cap: one signal backing up behind a slow
 	// Sentry must not stop the others from firing.
@@ -311,6 +331,17 @@ type config struct {
 	batchSize       int
 	sendWindow      time.Duration
 	spanSample      int
+
+	// The continuous trace stream (stream.go).
+	streamEnabled      bool
+	streamOTLPEnabled  bool
+	streamPollInterval time.Duration
+	// streamTimeout is how long a stream trace may take before it counts as
+	// lost. Deliberately not pollTimeout: a batch trace's deadline is measured
+	// from the batch's LAST send, so at defaults batch traces get 120-219s, and
+	// a flat 120s for the stream would cap its measurable latency exactly at the
+	// 120s trace alert threshold.
+	streamTimeout time.Duration
 }
 
 func configFromEnv() (config, error) {
@@ -353,20 +384,85 @@ func configFromEnv() (config, error) {
 			batchSize, maxSentryPerPage)
 	}
 
+	streamEnabled, err := envStrictBool("TRACE_STREAM_ENABLED", true)
+	if err != nil {
+		return config{}, err
+	}
+	streamOTLPEnabled, err := envStrictBool("TRACE_STREAM_OTLP_ENABLED", true)
+	if err != nil {
+		return config{}, err
+	}
+	streamPollInterval, err := envPositiveSeconds("TRACE_STREAM_POLL_SECONDS", 2)
+	if err != nil {
+		return config{}, err
+	}
+	streamTimeout, err := envPositiveSeconds("TRACE_STREAM_TIMEOUT_SECONDS", 300)
+	if err != nil {
+		return config{}, err
+	}
+	// findTraces searches the last hour (statsPeriod=1h). The cap keeps
+	// timeout + grace + polling slack well inside it, so a slow trace cannot
+	// fall out of the search window and read as lost. It also bounds the
+	// number of traces in flight, and so requests per poll, during an outage.
+	if streamTimeout > maxStreamTimeout {
+		return config{}, fmt.Errorf("TRACE_STREAM_TIMEOUT_SECONDS is %d, want at most %d: the stream's Sentry lookups only search the last hour", int(streamTimeout/time.Second), int(maxStreamTimeout/time.Second))
+	}
+
 	return config{
-		sentryDSN:       required["SENTRY_DSN"],
-		sentryAuthToken: required["SENTRY_AUTH_TOKEN"],
-		sentryOrg:       required["SENTRY_ORG"],
-		sentryProject:   required["SENTRY_PROJECT"],
-		ddAPIKey:        required["DD_API_KEY"],
-		ddSite:          ddSite,
-		interval:        envDuration("PROBE_INTERVAL_SECONDS", 120),
-		pollTimeout:     envDuration("POLL_TIMEOUT_SECONDS", 120),
-		pollInterval:    envDuration("POLL_INTERVAL_SECONDS", 5),
-		batchSize:       batchSize,
-		sendWindow:      envDuration("PROBE_SEND_WINDOW_SECONDS", 100),
-		spanSample:      envInt("SPAN_COMPLETENESS_SAMPLE", 20),
+		sentryDSN:          required["SENTRY_DSN"],
+		sentryAuthToken:    required["SENTRY_AUTH_TOKEN"],
+		sentryOrg:          required["SENTRY_ORG"],
+		sentryProject:      required["SENTRY_PROJECT"],
+		ddAPIKey:           required["DD_API_KEY"],
+		ddSite:             ddSite,
+		interval:           envDuration("PROBE_INTERVAL_SECONDS", 120),
+		pollTimeout:        envDuration("POLL_TIMEOUT_SECONDS", 120),
+		pollInterval:       envDuration("POLL_INTERVAL_SECONDS", 5),
+		batchSize:          batchSize,
+		sendWindow:         envDuration("PROBE_SEND_WINDOW_SECONDS", 100),
+		spanSample:         envInt("SPAN_COMPLETENESS_SAMPLE", 20),
+		streamEnabled:      streamEnabled,
+		streamOTLPEnabled:  streamOTLPEnabled,
+		streamPollInterval: streamPollInterval,
+		streamTimeout:      streamTimeout,
 	}, nil
+}
+
+// maxStreamTimeout caps TRACE_STREAM_TIMEOUT_SECONDS; see configFromEnv.
+const maxStreamTimeout = 30 * time.Minute
+
+// envStrictBool reads a true/false switch, or returns def when the variable is
+// unset or empty. Anything strconv.ParseBool cannot read is an error rather
+// than the default: a typo must not leave a stream sending 86,400 traces a day
+// that the operator believes are switched off.
+func envStrictBool(key string, def bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("%s is %q, want true or false", key, v)
+	}
+	return b, nil
+}
+
+// envPositiveSeconds reads a whole number of seconds, at least 1, or returns
+// def when the variable is unset or empty. Unlike envDuration it rejects input
+// it cannot use instead of quietly running on the default: "2s" or "abc" would
+// otherwise run at a value nobody chose. Zero is rejected because
+// time.NewTicker panics on a non-positive interval, which would take the batch
+// probes down with the stream.
+func envPositiveSeconds(key string, def int) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return time.Duration(def) * time.Second, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s is %q, want a whole number of seconds, at least 1", key, v)
+	}
+	return time.Duration(n) * time.Second, nil
 }
 
 func envDuration(key string, defaultSeconds int) time.Duration {

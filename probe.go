@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -22,11 +23,42 @@ func newSentryProbe(dsn, authToken, org, project string) *sentryProbe {
 	return &sentryProbe{dsn: dsn, authToken: authToken, org: org, project: project, baseURL: "https://sentry.io"}
 }
 
+// probeClient is a Sentry client whose sends can be confirmed: delivery sits
+// under its transport and records whether Sentry accepted each envelope (see
+// deliveryLog for why Flush alone cannot tell). Embedding keeps Flush and
+// Close available on the client itself.
+type probeClient struct {
+	*sentry.Client
+	delivery *deliveryLog
+}
+
+// newProbeClient builds a client from opts with a deliveryLog as its HTTP
+// transport. Any HTTPTransport already in opts is replaced.
+//
+// It refuses to build a client whose sends would skip the log. The SDK swaps
+// HTTPTransport for its own when SENTRYGODEBUG asks for httpdump or httptrace,
+// and an HTTPClient option would bypass it entirely. Every send would then be
+// unconfirmable and fail with a misleading "dropped by the SDK" message, so it
+// is better to say so once, here.
+func newProbeClient(opts sentry.ClientOptions) (probeClient, error) {
+	d := newDeliveryLog(nil, sentryEnvelopes)
+	opts.HTTPTransport = d
+	c, err := sentry.NewClient(opts)
+	if err != nil {
+		return probeClient{}, err
+	}
+	if got := c.Options(); got.HTTPTransport != http.RoundTripper(d) || got.HTTPClient != nil {
+		c.Close()
+		return probeClient{}, fmt.Errorf("sentry client bypasses send confirmation (HTTPTransport %T, HTTPClient set: %t); unset SENTRYGODEBUG httpdump/httptrace", got.HTTPTransport, got.HTTPClient != nil)
+	}
+	return probeClient{Client: c, delivery: d}, nil
+}
+
 // newTracingClient builds a client for transaction probes. EnableTracing is
 // required in sentry-go v0.x; without it transactions are dropped
 // (SampledFalse).
-func newTracingClient(dsn string) (*sentry.Client, error) {
-	return sentry.NewClient(sentry.ClientOptions{
+func newTracingClient(dsn string) (probeClient, error) {
+	return newProbeClient(sentry.ClientOptions{
 		Dsn:              dsn,
 		EnableTracing:    true,
 		TracesSampleRate: 1.0,
@@ -74,8 +106,8 @@ func batchKeyFor(batchID, signal string) string { return batchID + "-" + signal 
 // are 32 lowercase hex characters with no separators: TraceID.String() is
 // hex.Encode of the raw 16 bytes, and Sentry's "trace" field is the same
 // encoding. Do not reformat either side without changing the other.
-func sendTraceTagged(client *sentry.Client, batchKey string, seq, n int) (string, time.Time, error) {
-	hub := sentry.NewHub(client, sentry.NewScope())
+func sendTraceTagged(client probeClient, batchKey string, seq, n int) (string, time.Time, error) {
+	hub := sentry.NewHub(client.Client, sentry.NewScope())
 	hub.Scope().SetTag("probe_batch", batchKey)
 	hub.Scope().SetTag("probe_seq", strconv.Itoa(seq))
 	ctx := sentry.SetHubOnContext(context.Background(), hub)
@@ -117,6 +149,12 @@ func sendTraceTagged(client *sentry.Client, batchKey string, seq, n int) (string
 		// but success_rate stays unbiased, and the shortfall stays visible as
 		// the gap between sent and PROBE_BATCH_SIZE.
 		return "", time.Time{}, fmt.Errorf("flush transaction %s: transport did not drain within %s", traceID, batchFlushTimeout)
+	}
+	// A true Flush only means the transport is idle, not that this event was
+	// accepted: the SDK drops events on a request error or a rate-limit back-off
+	// and still drains. Only Sentry's own 2xx makes this send count as sent.
+	if err := client.delivery.confirm(traceID, 1, "transaction"); err != nil {
+		return "", time.Time{}, err
 	}
 	return traceID, sentAt, nil
 }
