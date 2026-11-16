@@ -75,9 +75,10 @@ func assertMetricTypes(t *testing.T, series []ddSeries, want map[string]int) {
 // ddRecorder is a fake Datadog series endpoint that captures every series
 // submitted to it.
 type ddRecorder struct {
-	mu     sync.Mutex
-	series []ddSeries
-	errs   []error
+	mu       sync.Mutex
+	series   []ddSeries
+	requests int
+	errs     []error
 }
 
 // newDDRecorder returns a recorder and a server that accepts submissions into
@@ -108,6 +109,7 @@ func (rec *ddRecorder) record(r *http.Request) {
 		return
 	}
 	rec.series = append(rec.series, payload.Series...)
+	rec.requests++
 }
 
 // captured returns everything the endpoint received. A capture failure aborts

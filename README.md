@@ -76,10 +76,13 @@ The trace signal is called `ingestion`, not `trace_ingestion`, so its metrics li
 |---|---|---|
 | 2xx | yes | Accepted |
 | 5xx | **yes** (logged) | Sentry's own ingest failed an event it received. Over HTTPS this cannot come from our network, and the SDK does not retry it, so a real customer's event is lost the same way. It never arrives and reads as **lost**, which is what the probe exists to catch |
-| 429 | no | Sentry rate limiting us: quota, not ingestion. The Sentry SDK then drops further events without a request until `Retry-After` passes, and those are not sent either; on the OTLP path every send gets its own 429 |
+| 429 | no | Sentry rate limiting us: quota, not ingestion. In the batch probes the Sentry SDK then drops further events without a request until `Retry-After` passes, and those are not sent either; in the streams every send is a fresh request and gets its own 429 |
 | 2xx that rejects spans (OTLP `partial_success`) | no (logged) | Sentry explicitly refusing them, as with a 4xx. The response does not say which spans, so every trace in that request is excluded rather than charged to Sentry |
 | other 4xx | no | Our fault: bad DSN key, malformed or oversized payload |
-| no response | no | Our network, or the SDK dropped it before sending |
+| no answer within 25s of the full request (**streams only**) | **yes** (logged, `probe.unanswered`) | Sentry's endpoint had the data and was too slow. Slowness is Sentry's, never ours, so it counts like a 5xx. See [When Sentry is slow](#when-sentry-is-slow) |
+| connection reset, closed or lost; refused; unreachable; a write that failed | no | Not provably Sentry's: our egress dying, an idle connection closed under us, an HTTP/2 stream refused. Only the final attempt counts if net/http retries |
+| no answer at all, in the batch probes | no | The batch probes' rule is unchanged: they wait 10s and any transport error is not sent |
+| dropped before any request | no | The SDK dropped it (buffer full, or a `Retry-After` in force) |
 
 This has to be checked per event because the SDK's own `Flush` cannot tell: it silently drops an event whose request failed, or that it held back during a `Retry-After`, and still reports success. Sends that do not count are logged with the reason.
 
@@ -113,13 +116,33 @@ Each stream publishes the same six metrics as a batch signal, plus one, once a m
 | `sentry.trace_stream.sent` | count | **count** | Traces **decided** this minute (arrived + lost), *not* traces sent this minute |
 | `sentry.trace_stream.received` | count | **count** | Traces that arrived this minute |
 | `sentry.trace_stream.success_rate` | % | gauge | `received / sent` over the same decided traces |
-| `sentry.trace_stream.complete_pct` | % | gauge | Of the traces counted this minute, the percentage with all 4 child spans stored. **Not published** in a minute when nothing was counted, so a failed count leaves a gap rather than a `0%` that would read as total span loss |
+| `sentry.trace_stream.census.checked` | count | **count** | Arrived traces whose child spans were counted this minute |
+| `sentry.trace_stream.census.complete` | count | **count** | Of those, traces with all 4 child spans stored. `sum(complete) / sum(checked)` is the completeness SLO ratio |
+| `sentry.trace_stream.complete_pct` | % | gauge | `complete / checked` for this minute alone. Swings on small samples; use the counts for anything over time |
+
+The three census metrics are **not published** in a minute when nothing was counted, so a failed count leaves a gap rather than a `0%` that would read as total span loss.
+
+Each stream also reports on itself, every minute, even a minute that decided nothing, so a broken probe can be told apart from a slow or lossy Sentry:
+
+| Metric | Datadog type | Meaning |
+|---|---|---|
+| `sentry.trace_stream.probe.send_failed` | count | Sends that did not count as sent (see the table in [Metrics emitted](#metrics-emitted)) |
+| `sentry.trace_stream.probe.send_skipped` | count | Seconds on which every send worker was still busy |
+| `sentry.trace_stream.probe.query_failed` | count | Sentry lookups that failed (an expired `SENTRY_AUTH_TOKEN` shows here) |
+| `sentry.trace_stream.probe.abandoned` | count | Traces dropped unmeasured because no lookup succeeded in time |
+| `sentry.trace_stream.probe.census_failed` | count | Child-span counts that failed |
+| `sentry.trace_stream.probe.census_dropped` | count | Traces dropped uncounted after 5 minutes of failed counts |
+| `sentry.trace_stream.probe.unanswered` | count | Sends Sentry left unanswered for 25s after the full request, counted as sent. A direct read of Sentry being slow to answer |
+| `sentry.trace_stream.probe.http_retried` | count | Sends net/http retried on a new HTTP/2 attempt (a refused stream, a GOAWAY). Also how a request can reach Sentry twice |
+| `sentry.trace_stream.probe.pending` | gauge | Traces in flight. Around 60 when healthy; it climbs when Sentry slows down |
+
+All of a minute's metrics go to Datadog in one request, so a slow Datadog costs one timeout per minute rather than one per metric.
 
 `sent` is the traces decided in the window, rather than the traces sent during it, because a trace sent in the last minute has usually not arrived yet. Dividing by sends would make `success_rate` read low every minute. Every trace is decided in exactly one window, so over any longer period the sum of `sent` still equals what was sent (less any dropped unmeasured).
 
 A minute that decides nothing **publishes no latency or reliability**. That covers startup until the first trace arrives, and any minute in which every Sentry query failed. The first minute usually decides only the few traces sent in its first seconds, so its percentiles rest on a tiny sample. Publishing would post `sent=0` and `success_rate=0`, which reads as a total outage. The stream's counts carry a 60s `interval`, not `PROBE_INTERVAL_SECONDS`.
 
-Sends are fired on a fixed one-second tick by a pool of 8 workers, so a slow Sentry flush cannot delay the next send. If all 8 are still busy, the tick is skipped and counted in the logs. Each minute logs one line:
+Sends are fired on a fixed one-second tick by a pool of 64 workers, so a slow Sentry cannot delay the next send. If all 64 are still busy, the tick is skipped and counted (`probe.send_skipped`). Each minute logs one line:
 
 ```
 [trace_stream] window: arrived=60 lost=0 p50=57.4s p95=1m4.2s complete=59/59 pending=58 send_failed=0 send_skipped=0 query_ok=30 query_failed=0 abandoned=0 census_failed=0 census_dropped=0
@@ -127,15 +150,25 @@ Sends are fired on a fixed one-second tick by a pool of 8 workers, so a slow Sen
 
 `pending` is the traces still in flight. At about one per second and ~60s to arrive, a healthy value is around 60.
 
+### When Sentry is slow
+
+The streams treat slowness as Sentry's, never ours, so a slow Sentry shows up as slow (or lost) rather than quietly shrinking the sample, and our own queues and network never show up as Sentry's:
+
+- **Each trace goes out at once, in its own request, on both paths.** The SDK stream sends each trace on its own client, because the Sentry SDK's transport sends one request at a time; the OTLP stream exports each trace directly, because a batch span processor runs its exports one at a time under a lock. Either way, a slow Sentry would otherwise build a queue on our side, and since latency runs from the send, our queue would be measured as Sentry's latency, and the slowest sends would fall out of the sample. 64 send workers per stream keep a slow Sentry from ever causing a skipped send.
+- **Sentry gets 25 seconds to answer, on the probe's own clock.** The clock starts with the request (connecting included). A request written in full that is still unanswered when it runs out is abandoned and counts as sent, like a 5xx, and is published as `probe.unanswered`. That is the only way a request with no answer counts as sent: a reset, a closed or lost connection, a refused stream or a failed write is not provably Sentry's and counts as not sent. If net/http retries a request on a new attempt, only the final attempt counts (a refused attempt stops counting as written the moment net/http decides to retry it), and the retry is published as `probe.http_retried`.
+- **A dead network path is ours, not Sentry's.** The streams use their own HTTP transport with HTTP/2 health pings: a connection whose path has died fails as a lost connection within about 15s (not sent), instead of leaving every send on it to run out the 25s and be charged to Sentry. A live Sentry answers pings at the protocol layer even while its ingest is slow, so a slow Sentry still reads as slow. HTTP/1.1 has no such pings: if a connection ever falls back to it, a path that dies after the write still runs out the 25s and reads as unanswered, which `probe.unanswered` makes visible.
+
+The batch probes keep their original rule: they wait 10s for a flush, and any transport error is not sent.
+
+Observed live on 2026-11-16: during a slowdown that Sentry's status page did not report, both streams' p95 rose from ~71s to 2m42s, in-flight traces grew from ~60 to ~150, and one trace's root was stored twice on each stream. Nothing was lost: all 200 traces per stream arrived, complete, and the lookups tolerate duplicate rows. The duplicates' cause is not established: Sentry storing a root twice, or net/http retrying a request on the shared HTTP/2 connection, which the probe now logs and counts.
+
 ### The OTLP stream
 
 The OTLP stream (`otlp.go`) sends the same probe trace (a `probe.login` root with 4 child spans, `probe_batch` on the root) built with the OpenTelemetry Go SDK and exported over OTLP/HTTP (protobuf) straight to Sentry's OTLP traces endpoint. That endpoint is a separate ingest path from the SDK's envelope endpoint, and Sentry documents it as **open beta**. Everything after the send is shared with the SDK stream: the same trace-id lookups, the same child-span count, the same timeout, the same metrics under its own name.
 
 It needs no extra configuration. The endpoint and key come from `SENTRY_DSN`: `https://<host>/api/<project>/integration/otlp/v1/traces`, authenticated with `x-sentry-auth: sentry sentry_key=<public key>`. Verified against a live project on 2026-11-16: the root is stored with `is_transaction:true` and the 4 children with `is_transaction:false`, exactly as for the SDK path, and became queryable in 51s.
 
-It counts sends by the same rule as the SDK path (the table in [Metrics emitted](#metrics-emitted)), checked per trace under the exporter's HTTP client. The exporter's retries are off, as the Sentry SDK has none, so each request's outcome is final. Spans go through a batch span processor, as a real OTel app would send them, flushed after each trace, with the sampler and batch settings pinned so `OTEL_TRACES_SAMPLER` or `OTEL_BSP_*` in the environment cannot change what is sent.
-
-Two things differ from the SDK path, and the send check handles both. One export request carries every trace queued when it runs, so when Sentry is slow several traces share a request. And a trace can be split: its children can go out in an earlier request than its root. So a trace counts as sent only if **all 5 of its spans** were carried by requests that count as sent; a single failed request among them, or a span our side lost without any request, excludes it. Each send waits at most 10s for its spans to be exported, but never cancels the request itself, which may carry other traces.
+It counts sends by the same rule as the SDK stream (the table in [Metrics emitted](#metrics-emitted)), checked per trace under the exporter's HTTP client. The exporter's retries are off, as the Sentry SDK has none, so each request's outcome is final. Each trace's 5 spans are exported together in their own request, directly rather than through a batch span processor (see [When Sentry is slow](#when-sentry-is-slow) for why), and the trace counts as sent only if all 5 were accepted. The sampler is pinned so `OTEL_TRACES_SAMPLER` in the environment cannot change what is sent.
 
 It runs on a private OpenTelemetry provider and is unrelated to the Datadog OTLP exporter in `tracer.go`.
 
@@ -261,6 +294,8 @@ Zero send errors, zero query errors, zero Datadog post errors, zero skipped cycl
 
 Use those numbers as a **reference baseline, not a guarantee**. Two cycles at batch size 10 is a first measurement, not a soak test — it says nothing about the tail beyond the maximum, about behaviour at the default batch size of 100, or about how any of this drifts over days.
 
+**The trace streams were verified live against Sentry on 2026-11-16, with Datadog posting switched off.** Several 200-second runs with both streams side by side: every trace sent reached Sentry (200 of 200 per stream, per run, counted independently in Sentry), every one with all 4 child spans, and the probe's own arrived/complete counts matched. Healthy latency was about 50s at p50 and 71–76s at p95 on both ingest paths. One run caught an undeclared Sentry slowdown (p95 2m42s) in which nothing was lost. **Not yet verified:** the streams' metrics arriving in Datadog (the wire format is unit tested), and the Docker image itself.
+
 The batch path **is** wired into `main.go` — the legacy single-event path and its alert-webhook probe have been deleted, so no single-event sender remains in the tree. That is what turns the latency signal into real p50/p95/p99 percentiles plus a success rate rather than a single sample.
 
 The batch rewrite is merged to `main`. If you have dashboards or monitors built against the pre-batch metric names, they need updating: the names changed, and Datadog will show them as permanently no-data rather than erroring. The design and task plan live in `docs/`.
@@ -291,4 +326,4 @@ go test ./... -race
 go vet ./...
 ```
 
-The pure logic — percentiles, send pacing, latency tracking, batch stop conditions, batch ids, the in-flight cap, the span-completeness suppression rule, the trace stream's arrived/lost/dropped rules, its child-span count and its run loop, the OTLP sender against a fake OTLP endpoint (concurrent sends sharing and splitting requests, `partial_success`, flush timeouts), send confirmation against a fake Sentry ingest endpoint (rejected, refused and rate-limited sends), and the Sentry/Datadog request shapes — is unit tested against `httptest` servers. The probe functions, `runBatchLoop`, `runStreamProbe`, `runTraceStreamProbe` and `runOTLPStreamProbe` are network and process glue, marked as untested in the source, and verified by running against live Sentry and Datadog.
+The pure logic — percentiles, send pacing, latency tracking, batch stop conditions, batch ids, the in-flight cap, the span-completeness suppression rule, the trace stream's arrived/lost/dropped rules, its child-span count and its run loop, the OTLP sender against a fake OTLP endpoint (one request per trace, `partial_success`, no queueing behind a slow Sentry), the unanswered-request rule against a scripted connection, send confirmation against a fake Sentry ingest endpoint (rejected, refused and rate-limited sends), and the Sentry/Datadog request shapes — is unit tested against `httptest` servers. The probe functions, `runBatchLoop`, `runStreamProbe`, `runTraceStreamProbe` and `runOTLPStreamProbe` are network and process glue, marked as untested in the source, and verified by running against live Sentry and Datadog.

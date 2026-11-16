@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -59,6 +60,10 @@ type streamWindow struct {
 	complete      int // of those, traces with every child span stored
 	censusFailed  int // census requests that returned an error
 	censusDropped int // traces dropped uncounted after the census kept failing
+
+	// From the stream's delivery log (deliveryStats), filled in at report time.
+	unanswered int // sends Sentry left unanswered past the answer timer, counted as sent
+	retried    int // sends net/http retried on a new attempt
 }
 
 // result converts a window into the batchResult postBatchMetrics publishes.
@@ -304,13 +309,16 @@ const (
 	// in case the Sentry API recovers, before it is dropped unmeasured. It also
 	// caps the pessimistic latency a polling outage can produce.
 	traceStreamGrace = 30 * time.Second
-	// traceStreamSendWorkers matches the batch probes' send pool.
-	traceStreamSendWorkers = 8
+	// traceStreamSendWorkers bounds a stream's in-flight sends. Each send waits
+	// for Sentry's answer, up to streamAnswerTimeout, so at one send a second a
+	// slow Sentry can hold ~25 at once; 64 keeps a slow Sentry from ever
+	// causing a skipped send, which would shrink the sample exactly when it
+	// matters.
+	traceStreamSendWorkers = 64
 	// traceStreamCensusSettle is how long after its root arrives a trace's
-	// child spans are counted. On the SDK path children travel in the same
-	// envelope as the root; on the OTLP path in the same request or an earlier
-	// one. A minute is generous either way: it only has to keep a healthy trace
-	// from being scored before its children are queryable.
+	// child spans are counted. On both paths children travel in the same
+	// request as the root, so a minute is generous: it only has to keep a
+	// healthy trace from being scored before its children are queryable.
 	traceStreamCensusSettle = 60 * time.Second
 	// traceStreamCensusGiveUp is how long a failing census keeps retrying a
 	// trace before dropping it uncounted.
@@ -432,14 +440,21 @@ const (
 // which reads as a total outage; the gap in the series is the honest signal.
 // (The first window usually decides only the few traces sent in its first
 // seconds, so its percentiles rest on a tiny sample.) Once anything is decided,
-// postBatchMetrics applies the same rules as the batch probes, including no
-// latency percentiles when nothing arrived.
+// batchPoints applies the same rules as the batch probes, including no latency
+// percentiles when nothing arrived.
 //
-// Completeness: sentry.<signal>.complete_pct is published whenever the census
-// counted anything, independently of the above, because the census looks at
-// traces that arrived a minute or more earlier. A failed census publishes
-// nothing rather than a 0% that would read as total span loss. A gauge: it is
-// a level, like span_completeness.received_pct.
+// Completeness: census.checked and census.complete (counts, so a metric-based
+// SLO can divide their sums) and complete_pct (a gauge, the window's level) are
+// published whenever the census counted anything, independently of the above,
+// because the census looks at traces that arrived a minute or more earlier. A
+// failed census publishes none of them rather than a 0% that would read as
+// total span loss.
+//
+// Probe health: sentry.<signal>.probe.* (failed and skipped sends, failed
+// queries, abandoned traces, census failures and drops, and pending) every
+// window, even one that decided nothing. They describe the probe rather than
+// Sentry, so a broken probe can be told apart from a slow or lossy Sentry on a
+// dashboard.
 func reportTraceStream(dd *datadogClient, signal string, w streamWindow, baseTags []string) {
 	p50, p95 := "n/a", "n/a"
 	if len(w.arrived) > 0 {
@@ -450,19 +465,38 @@ func reportTraceStream(dd *datadogClient, signal string, w streamWindow, baseTag
 	if w.censused > 0 {
 		complete = fmt.Sprintf("%d/%d", w.complete, w.censused)
 	}
-	log.Printf("[%s] window: arrived=%d lost=%d p50=%s p95=%s complete=%s pending=%d send_failed=%d send_skipped=%d query_ok=%d query_failed=%d abandoned=%d census_failed=%d census_dropped=%d",
-		signal, len(w.arrived), w.lost, p50, p95, complete, w.pending, w.sendFailed, w.sendSkipped, w.queryOK, w.queryFailed, w.abandoned, w.censusFailed, w.censusDropped)
+	log.Printf("[%s] window: arrived=%d lost=%d p50=%s p95=%s complete=%s pending=%d send_failed=%d send_skipped=%d unanswered=%d http_retried=%d query_ok=%d query_failed=%d abandoned=%d census_failed=%d census_dropped=%d",
+		signal, len(w.arrived), w.lost, p50, p95, complete, w.pending, w.sendFailed, w.sendSkipped, w.unanswered, w.retried, w.queryOK, w.queryFailed, w.abandoned, w.censusFailed, w.censusDropped)
 
+	tags := append(append([]string{}, baseTags...), "probe:"+signal)
+	// Probe health, every window: these describe the probe, not Sentry, and a
+	// window of failing queries is exactly when they matter.
+	pts := []metricPoint{
+		{"sentry." + signal + ".probe.send_failed", ddTypeCount, float64(w.sendFailed)},
+		{"sentry." + signal + ".probe.send_skipped", ddTypeCount, float64(w.sendSkipped)},
+		{"sentry." + signal + ".probe.query_failed", ddTypeCount, float64(w.queryFailed)},
+		{"sentry." + signal + ".probe.abandoned", ddTypeCount, float64(w.abandoned)},
+		{"sentry." + signal + ".probe.census_failed", ddTypeCount, float64(w.censusFailed)},
+		{"sentry." + signal + ".probe.census_dropped", ddTypeCount, float64(w.censusDropped)},
+		{"sentry." + signal + ".probe.unanswered", ddTypeCount, float64(w.unanswered)},
+		{"sentry." + signal + ".probe.http_retried", ddTypeCount, float64(w.retried)},
+		{"sentry." + signal + ".probe.pending", ddTypeGauge, float64(w.pending)},
+	}
 	if res := w.result(); res.sent > 0 {
-		dd.postBatchMetrics(signal, res, baseTags)
+		pts = append(pts, batchPoints(signal, res)...)
 	} else {
 		log.Printf("[%s] no trace was decided this window, so no latency or reliability is published (query_failed=%d: if that is non-zero every cycle, check SENTRY_AUTH_TOKEN and SENTRY_ORG)", signal, w.queryFailed)
 	}
 	if w.censused > 0 {
-		dd.postMetricLogged("sentry."+signal+".complete_pct", ddTypeGauge,
-			float64(w.complete)/float64(w.censused)*100,
-			append(append([]string{}, baseTags...), "probe:"+signal))
+		pts = append(pts,
+			metricPoint{"sentry." + signal + ".census.checked", ddTypeCount, float64(w.censused)},
+			metricPoint{"sentry." + signal + ".census.complete", ddTypeCount, float64(w.complete)},
+			metricPoint{"sentry." + signal + ".complete_pct", ddTypeGauge, float64(w.complete) / float64(w.censused) * 100},
+		)
 	}
+	// One request per window: a slow Datadog then costs one timeout per
+	// window, not one per metric, and cannot push the next window back.
+	dd.postPointsLogged(signal, pts, tags)
 }
 
 // takeWindow returns what the current window decided and starts a new one.
@@ -486,7 +520,7 @@ func (s *traceStream) takeWindow() streamWindow {
 // PROCESS GLUE, like runTraceBatch: it composes pieces that are each tested
 // (findTraces, findBatchSpanCounts, traceStream, runTraceStream,
 // reportTraceStream) and is verified end to end by a live run.
-func runStreamProbe(ctx context.Context, s *sentryProbe, cfg config, signal, streamKey string, send sendFunc, baseTags []string) {
+func runStreamProbe(ctx context.Context, s *sentryProbe, cfg config, signal, streamKey string, send sendFunc, stats *deliveryStats, baseTags []string) {
 	io := streamIO{
 		send: send,
 		query: func(ctx context.Context, ids []string) (map[string]bool, error) {
@@ -506,34 +540,90 @@ func runStreamProbe(ctx context.Context, s *sentryProbe, cfg config, signal, str
 	log.Printf("[%s] starting (send every %s, poll every %s, report every %s, lost after %s, census %s after arrival, probe_batch=%s)",
 		signal, traceStreamSendInterval, cfg.streamPollInterval, traceStreamReportInterval, cfg.streamTimeout, traceStreamCensusSettle, streamKey)
 	runTraceStream(ctx, streamConfigFrom(cfg), ts, io, func(w streamWindow) {
+		w.unanswered, w.retried = stats.take()
 		reportTraceStream(dd, signal, w, baseTags)
 	})
 }
 
+// The streams' timing for Sentry's answer.
+//
+// streamAnswerTimeout is the decider: the delivery log gives Sentry this long,
+// on its own clock, to answer a request written in full, and abandons it as
+// unanswered (counted as sent) when it runs out. The clients' own timeouts,
+// streamClientTimeout, sit beyond it so they never pre-empt it, and
+// streamAnswerBackstop (the SDK stream's Flush wait) beyond those, only to
+// catch a client stuck for some other reason.
+const (
+	streamAnswerTimeout  = 25 * time.Second
+	streamClientTimeout  = 30 * time.Second // the Sentry SDK's own HTTP timeout
+	streamAnswerBackstop = 45 * time.Second
+)
+
+// streamDeliveryPolicy is the streams' rule for unanswered requests (see
+// deliveryPolicy), counting into stats.
+func streamDeliveryPolicy(stats *deliveryStats) deliveryPolicy {
+	return deliveryPolicy{answerTimeout: streamAnswerTimeout, stats: stats}
+}
+
+// streamTransport is the streams' HTTP transport, shared by both paths.
+//
+// HTTP/2 health pings make a dead network path fail as a lost connection
+// within about 15s (not sent: ours), rather than leave every send on it to
+// run out the answer timer and be charged to Sentry as unanswered. A live
+// Sentry answers pings at the protocol layer even while its ingest is slow, so
+// a slow Sentry still reads as slow. MaxIdleConnsPerHost covers the stream's
+// 64 concurrent sends, so a burst does not churn through new TLS handshakes
+// inside measured sends.
+var streamTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = traceStreamSendWorkers
+	t.HTTP2 = &http.HTTP2Config{SendPingTimeout: 10 * time.Second, PingTimeout: 5 * time.Second}
+	return t
+}()
+
+// streamSDKSend returns the Sentry SDK stream's send: one probe trace on its
+// own client, waiting for Sentry's answer.
+//
+// A client per send, because the SDK's transport sends one request at a time:
+// with a shared client, a slow Sentry would queue each trace behind the
+// previous ones, and our own queue would be measured as Sentry's latency
+// (latency runs from the send). Each client is closed when its send returns,
+// so its transport goroutine does not outlive it (see runTraceBatch). A fresh
+// client also forgets any Retry-After, so during a rate limit every stream send
+// gets its own 429 and counts as not sent.
+func streamSDKSend(dsn, streamKey string, stats *deliveryStats) sendFunc {
+	return func(ctx context.Context, seq int) (string, time.Time, error) {
+		client, err := newStreamTracingClient(dsn, stats)
+		if err != nil {
+			return "", time.Time{}, fmt.Errorf("sentry client: %w", err)
+		}
+		defer client.Close()
+		return sendTraceWithin(client, streamKey, seq, traceProbeSpans, streamAnswerBackstop)
+	}
+}
+
 // runTraceStreamProbe runs the Sentry SDK stream until ctx is cancelled.
 func runTraceStreamProbe(ctx context.Context, s *sentryProbe, cfg config, runID string, baseTags []string) {
-	// One client for the life of the stream. A sentry.Client owns a transport
-	// goroutine that exits only on Close, so a client per send would leak two
-	// goroutines a second (see runTraceBatch). Close runs after runStreamProbe
-	// returns, by which time runTraceStream has joined every in-flight send.
+	// Build one client up front only to fail fast on a bad DSN; each send
+	// builds its own (streamSDKSend).
 	client, err := newTracingClient(s.dsn)
 	if err != nil {
 		log.Printf("[%s] client: %v — trace stream disabled for this run", traceStreamSignal, err)
 		return
 	}
-	defer client.Close()
+	client.Close()
 
 	// Tagged like the batch probes so a stream trace can be found in Sentry and
 	// traced back to the process that sent it. Lookups go by trace id, not tag.
 	streamKey := runID + "-" + traceStreamSignal
-	runStreamProbe(ctx, s, cfg, traceStreamSignal, streamKey, func(ctx context.Context, seq int) (string, time.Time, error) {
-		return sendTraceTagged(client, streamKey, seq, traceProbeSpans)
-	}, baseTags)
+	stats := &deliveryStats{}
+	runStreamProbe(ctx, s, cfg, traceStreamSignal, streamKey, streamSDKSend(s.dsn, streamKey, stats), stats, baseTags)
 }
 
 // runOTLPStreamProbe runs the OpenTelemetry/OTLP stream until ctx is cancelled.
 func runOTLPStreamProbe(ctx context.Context, s *sentryProbe, cfg config, runID string, baseTags []string) {
-	o, err := newOTLPSender(s.dsn)
+	stats := &deliveryStats{}
+	o, err := newOTLPSender(s.dsn, stats)
 	if err != nil {
 		log.Printf("[%s] sender: %v — OTLP stream disabled for this run", traceStreamOTLPSignal, err)
 		return
@@ -545,5 +635,5 @@ func runOTLPStreamProbe(ctx context.Context, s *sentryProbe, cfg config, runID s
 	streamKey := runID + "-" + traceStreamOTLPSignal
 	runStreamProbe(ctx, s, cfg, traceStreamOTLPSignal, streamKey, func(ctx context.Context, seq int) (string, time.Time, error) {
 		return o.send(streamKey, seq, traceProbeSpans)
-	}, baseTags)
+	}, stats, baseTags)
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -272,93 +273,6 @@ func errorsIfNone(ids []string) error {
 	return nil
 }
 
-// TestReportTraceStream pins what one window publishes.
-func TestReportTraceStream(t *testing.T) {
-	baseTags := []string{"sentry_org:o", "sentry_project:p"}
-
-	t.Run("sent is the traces decided in the window", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		// 3 arrived, 1 lost, plus noise that must not leak into the numbers:
-		// in-flight traces are undecided, failed sends never left, and abandoned
-		// traces were never measured.
-		w := streamWindow{
-			arrived: []time.Duration{time.Second, 2 * time.Second, 3 * time.Second},
-			lost:    1, pending: 57, sendFailed: 2, abandoned: 4, queryOK: 29, queryFailed: 1,
-		}
-		reportTraceStream(d, "trace_stream", w, baseTags)
-
-		series := rec.captured(t)
-		want := []string{
-			"sentry.trace_stream.latency_ms.p50",
-			"sentry.trace_stream.latency_ms.p95",
-			"sentry.trace_stream.latency_ms.p99",
-			"sentry.trace_stream.received",
-			"sentry.trace_stream.sent",
-			"sentry.trace_stream.success_rate",
-		}
-		if got := metricNames(series); !slices.Equal(got, want) {
-			t.Fatalf("metric names\n got: %v\nwant: %v", got, want)
-		}
-		assertTags(t, series, []string{"probe:trace_stream", "sentry_org:o", "sentry_project:p"})
-		for _, c := range []struct {
-			metric string
-			value  float64
-		}{
-			{"sentry.trace_stream.latency_ms.p50", 2000},
-			{"sentry.trace_stream.latency_ms.p95", 3000},
-			{"sentry.trace_stream.latency_ms.p99", 3000},
-			{"sentry.trace_stream.sent", 4},
-			{"sentry.trace_stream.received", 3},
-			{"sentry.trace_stream.success_rate", 75},
-		} {
-			if got := metricValue(t, series, c.metric); got != c.value {
-				t.Errorf("%s = %v, want %v", c.metric, got, c.value)
-			}
-		}
-	})
-
-	t.Run("total loss publishes reliability but no latency", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		reportTraceStream(d, "trace_stream", streamWindow{lost: 60, queryOK: 30}, baseTags)
-
-		series := rec.captured(t)
-		want := []string{
-			"sentry.trace_stream.received",
-			"sentry.trace_stream.sent",
-			"sentry.trace_stream.success_rate",
-		}
-		if got := metricNames(series); !slices.Equal(got, want) {
-			t.Fatalf("metric names\n got: %v\nwant: %v", got, want)
-		}
-		if got := metricValue(t, series, "sentry.trace_stream.success_rate"); got != 0 {
-			t.Errorf("success_rate = %v, want 0", got)
-		}
-	})
-
-	// The first minute after startup decides nothing: every query succeeds, but
-	// traces take ~60s to arrive and none has reached its deadline. Publishing
-	// would post sent=0 and success_rate=0, a false total outage. This is the
-	// case postBatchMetrics' own measured check does not catch, because the
-	// queries did succeed.
-	t.Run("startup window that decided nothing publishes nothing", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		reportTraceStream(d, "trace_stream", streamWindow{pending: 60, queryOK: 30}, baseTags)
-
-		if series := rec.captured(t); len(series) != 0 {
-			t.Errorf("published %v for a window that decided nothing", metricNames(series))
-		}
-	})
-
-	t.Run("window in which every query failed publishes nothing", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		reportTraceStream(d, "trace_stream", streamWindow{pending: 60, queryFailed: 30, abandoned: 3}, baseTags)
-
-		if series := rec.captured(t); len(series) != 0 {
-			t.Errorf("published %v for a window with no successful query", metricNames(series))
-		}
-	})
-}
-
 // windowLog collects reported windows from runTraceStream's report goroutine.
 type windowLog struct {
 	mu sync.Mutex
@@ -527,7 +441,7 @@ func TestRunTraceStreamSkipsWhenWorkersBusy(t *testing.T) {
 // main hands the stream's Datadog client.
 func TestStreamConfigFrom(t *testing.T) {
 	got := streamConfigFrom(config{streamPollInterval: 3 * time.Second})
-	want := streamConfig{sendInterval: time.Second, pollInterval: 3 * time.Second, reportInterval: 60 * time.Second, sendWorkers: 8}
+	want := streamConfig{sendInterval: time.Second, pollInterval: 3 * time.Second, reportInterval: 60 * time.Second, sendWorkers: 64}
 	if got != want {
 		t.Errorf("streamConfigFrom = %+v, want %+v", got, want)
 	}
@@ -781,68 +695,6 @@ func TestTraceStreamCensusOnlyArrivedTraces(t *testing.T) {
 	}
 }
 
-// TestReportTraceStreamCompleteness pins the census metric: the percentage of
-// censused traces with every child span stored, a gauge (it is a level, like
-// span_completeness.received_pct), published only when something was censused.
-func TestReportTraceStreamCompleteness(t *testing.T) {
-	baseTags := []string{"sentry_org:o", "sentry_project:p"}
-
-	t.Run("published alongside the window's other metrics", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		w := streamWindow{arrived: []time.Duration{time.Second}, queryOK: 30, censused: 4, complete: 3}
-		reportTraceStream(d, "trace_stream", w, baseTags)
-
-		series := rec.captured(t)
-		if got := metricValue(t, series, "sentry.trace_stream.complete_pct"); got != 75 {
-			t.Errorf("complete_pct = %v, want 75", got)
-		}
-		for _, s := range series {
-			if s.Metric == "sentry.trace_stream.complete_pct" && s.Type != ddTypeGauge {
-				t.Errorf("complete_pct type = %d, want gauge", s.Type)
-			}
-		}
-		assertTags(t, series, []string{"probe:trace_stream", "sentry_org:o", "sentry_project:p"})
-	})
-
-	// The census looks at traces that arrived a minute or more ago, so it can
-	// have work in a window that decided nothing new.
-	t.Run("published alone when nothing was decided", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		reportTraceStream(d, "trace_stream", streamWindow{queryOK: 30, censused: 10, complete: 10}, baseTags)
-		series := rec.captured(t)
-		if got := metricNames(series); !slices.Equal(got, []string{"sentry.trace_stream.complete_pct"}) {
-			t.Errorf("metric names = %v, want only complete_pct", got)
-		}
-	})
-
-	// A failed census measured nothing. Publishing 0% would read as total span
-	// loss.
-	t.Run("not published when nothing was censused", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		w := streamWindow{arrived: []time.Duration{time.Second}, queryOK: 30, censusFailed: 1}
-		reportTraceStream(d, "trace_stream", w, baseTags)
-		for _, name := range metricNames(rec.captured(t)) {
-			if name == "sentry.trace_stream.complete_pct" {
-				t.Error("complete_pct published although nothing was censused")
-			}
-		}
-	})
-
-	// The OTLP stream reuses the reporter under its own signal.
-	t.Run("named for the stream's signal", func(t *testing.T) {
-		d, rec := newTestDatadogClient(t)
-		w := streamWindow{arrived: []time.Duration{time.Second}, queryOK: 30, censused: 2, complete: 2}
-		reportTraceStream(d, "trace_stream_otlp", w, baseTags)
-		series := rec.captured(t)
-		for _, s := range series {
-			if !strings.HasPrefix(s.Metric, "sentry.trace_stream_otlp.") {
-				t.Errorf("metric %s is not under sentry.trace_stream_otlp.", s.Metric)
-			}
-		}
-		assertTags(t, series, []string{"probe:trace_stream_otlp", "sentry_org:o", "sentry_project:p"})
-	})
-}
-
 // TestTraceStreamCensusOldestFirst: census requests go oldest arrival first,
 // so if a census is cut short (cancelled, or failing partway), the traces
 // nearest their give-up deadline are the ones that got counted.
@@ -861,5 +713,209 @@ func TestTraceStreamCensusOldestFirst(t *testing.T) {
 	s.census(context.Background(), c.count)
 	if len(c.asked) != 1 || !slices.Equal(c.asked[0], ids) {
 		t.Errorf("census asked %v, want [%v] (arrival order)", c.asked, ids)
+	}
+}
+
+// healthNames are the probe-health metrics every window publishes for signal.
+func healthNames(signal string) []string {
+	var names []string
+	for _, n := range []string{"abandoned", "census_dropped", "census_failed", "http_retried", "pending", "query_failed", "send_failed", "send_skipped", "unanswered"} {
+		names = append(names, "sentry."+signal+".probe."+n)
+	}
+	return names
+}
+
+func sortedNames(groups ...[]string) []string {
+	var all []string
+	for _, g := range groups {
+		all = append(all, g...)
+	}
+	sort.Strings(all)
+	return all
+}
+
+var reliabilityNames = []string{
+	"sentry.trace_stream.latency_ms.p50",
+	"sentry.trace_stream.latency_ms.p95",
+	"sentry.trace_stream.latency_ms.p99",
+	"sentry.trace_stream.received",
+	"sentry.trace_stream.sent",
+	"sentry.trace_stream.success_rate",
+}
+
+var censusNames = []string{
+	"sentry.trace_stream.census.checked",
+	"sentry.trace_stream.census.complete",
+	"sentry.trace_stream.complete_pct",
+}
+
+// TestReportTraceStream pins what one window publishes: probe health always;
+// latency and reliability only when something was decided; completeness only
+// when something was counted. All of it in one Datadog request, so a slow
+// Datadog costs one timeout per window, not one per metric, and cannot push the
+// next window back.
+func TestReportTraceStream(t *testing.T) {
+	baseTags := []string{"sentry_org:o", "sentry_project:p"}
+
+	t.Run("a full window", func(t *testing.T) {
+		d, rec := newTestDatadogClient(t)
+		// 3 arrived, 1 lost; 4 counted, 3 complete; plus probe-health noise
+		// that must not leak into the Sentry-health numbers.
+		w := streamWindow{
+			arrived: []time.Duration{time.Second, 2 * time.Second, 3 * time.Second},
+			lost:    1, pending: 57, sendFailed: 2, sendSkipped: 5, abandoned: 4, queryOK: 29, queryFailed: 1,
+			censused: 4, complete: 3, censusFailed: 6, censusDropped: 7, unanswered: 8, retried: 9,
+		}
+		reportTraceStream(d, "trace_stream", w, baseTags)
+
+		series := rec.captured(t)
+		if want := sortedNames(reliabilityNames, censusNames, healthNames("trace_stream")); !slices.Equal(metricNames(series), want) {
+			t.Fatalf("metric names\n got: %v\nwant: %v", metricNames(series), want)
+		}
+		if rec.requests != 1 {
+			t.Errorf("window posted in %d requests, want 1", rec.requests)
+		}
+		assertTags(t, series, []string{"probe:trace_stream", "sentry_org:o", "sentry_project:p"})
+		for _, c := range []struct {
+			metric string
+			value  float64
+		}{
+			{"sentry.trace_stream.latency_ms.p50", 2000},
+			{"sentry.trace_stream.latency_ms.p95", 3000},
+			{"sentry.trace_stream.sent", 4}, // decided: arrived + lost
+			{"sentry.trace_stream.received", 3},
+			{"sentry.trace_stream.success_rate", 75},
+			{"sentry.trace_stream.census.checked", 4},
+			{"sentry.trace_stream.census.complete", 3},
+			{"sentry.trace_stream.complete_pct", 75},
+			{"sentry.trace_stream.probe.pending", 57},
+			{"sentry.trace_stream.probe.send_failed", 2},
+			{"sentry.trace_stream.probe.send_skipped", 5},
+			{"sentry.trace_stream.probe.query_failed", 1},
+			{"sentry.trace_stream.probe.abandoned", 4},
+			{"sentry.trace_stream.probe.census_failed", 6},
+			{"sentry.trace_stream.probe.census_dropped", 7},
+			{"sentry.trace_stream.probe.unanswered", 8},
+			{"sentry.trace_stream.probe.http_retried", 9},
+		} {
+			if got := metricValue(t, series, c.metric); got != c.value {
+				t.Errorf("%s = %v, want %v", c.metric, got, c.value)
+			}
+		}
+		// Tallies are counts (they sum across windows, and back metric-based
+		// SLOs: received/sent, complete/checked); levels are gauges.
+		types := map[string]int{
+			"sentry.trace_stream.latency_ms.p50": ddTypeGauge, "sentry.trace_stream.latency_ms.p95": ddTypeGauge,
+			"sentry.trace_stream.latency_ms.p99": ddTypeGauge, "sentry.trace_stream.success_rate": ddTypeGauge,
+			"sentry.trace_stream.complete_pct": ddTypeGauge, "sentry.trace_stream.probe.pending": ddTypeGauge,
+			"sentry.trace_stream.sent": ddTypeCount, "sentry.trace_stream.received": ddTypeCount,
+			"sentry.trace_stream.census.checked": ddTypeCount, "sentry.trace_stream.census.complete": ddTypeCount,
+		}
+		for _, n := range healthNames("trace_stream") {
+			if n != "sentry.trace_stream.probe.pending" {
+				types[n] = ddTypeCount
+			}
+		}
+		assertMetricTypes(t, series, types)
+	})
+
+	t.Run("total loss publishes reliability but no latency", func(t *testing.T) {
+		d, rec := newTestDatadogClient(t)
+		reportTraceStream(d, "trace_stream", streamWindow{lost: 60, queryOK: 30}, baseTags)
+		series := rec.captured(t)
+		want := sortedNames([]string{"sentry.trace_stream.received", "sentry.trace_stream.sent", "sentry.trace_stream.success_rate"}, healthNames("trace_stream"))
+		if !slices.Equal(metricNames(series), want) {
+			t.Fatalf("metric names\n got: %v\nwant: %v", metricNames(series), want)
+		}
+		if got := metricValue(t, series, "sentry.trace_stream.success_rate"); got != 0 {
+			t.Errorf("success_rate = %v, want 0", got)
+		}
+	})
+
+	// The first minute after startup decides nothing (traces take ~60s to
+	// arrive), and neither does a window in which every query failed.
+	// Publishing reliability would post sent=0 and success_rate=0, a false
+	// total outage. Probe health still goes out: it is about the probe, and a
+	// window of failing queries is exactly when it matters.
+	t.Run("a window that decided nothing publishes only probe health", func(t *testing.T) {
+		for _, w := range []streamWindow{
+			{pending: 60, queryOK: 30},                   // startup
+			{pending: 60, queryFailed: 30, abandoned: 3}, // every query failed
+		} {
+			d, rec := newTestDatadogClient(t)
+			reportTraceStream(d, "trace_stream", w, baseTags)
+			series := rec.captured(t)
+			if !slices.Equal(metricNames(series), healthNames("trace_stream")) {
+				t.Errorf("window %+v published %v, want only probe health", w, metricNames(series))
+			}
+			if got := metricValue(t, series, "sentry.trace_stream.probe.query_failed"); got != float64(w.queryFailed) {
+				t.Errorf("query_failed = %v, want %d", got, w.queryFailed)
+			}
+		}
+	})
+
+	// The census looks at traces that arrived a minute or more ago, so it can
+	// have work in a window that decided nothing new. A failed census counted
+	// nothing, so it publishes no completeness: 0% would read as total span
+	// loss.
+	t.Run("completeness independent of the decided-gate, and absent when nothing was counted", func(t *testing.T) {
+		d, rec := newTestDatadogClient(t)
+		reportTraceStream(d, "trace_stream", streamWindow{queryOK: 30, censused: 10, complete: 10}, baseTags)
+		if want := sortedNames(censusNames, healthNames("trace_stream")); !slices.Equal(metricNames(rec.captured(t)), want) {
+			t.Errorf("metric names = %v, want %v", metricNames(rec.captured(t)), want)
+		}
+
+		d2, rec2 := newTestDatadogClient(t)
+		reportTraceStream(d2, "trace_stream", streamWindow{arrived: []time.Duration{time.Second}, queryOK: 30, censusFailed: 1}, baseTags)
+		for _, name := range metricNames(rec2.captured(t)) {
+			if strings.Contains(name, "census.") || strings.HasSuffix(name, "complete_pct") {
+				t.Errorf("%s published although nothing was counted", name)
+			}
+		}
+	})
+
+	t.Run("named for the stream's signal", func(t *testing.T) {
+		d, rec := newTestDatadogClient(t)
+		w := streamWindow{arrived: []time.Duration{time.Second}, queryOK: 30, censused: 2, complete: 2}
+		reportTraceStream(d, "trace_stream_otlp", w, baseTags)
+		series := rec.captured(t)
+		for _, s := range series {
+			if !strings.HasPrefix(s.Metric, "sentry.trace_stream_otlp.") {
+				t.Errorf("metric %s is not under sentry.trace_stream_otlp.", s.Metric)
+			}
+		}
+		assertTags(t, series, []string{"probe:trace_stream_otlp", "sentry_org:o", "sentry_project:p"})
+	})
+}
+
+// TestStreamSDKSendDoesNotQueueBehindASlowSentry: the Sentry SDK's transport
+// sends one request at a time, so with one shared client a slow Sentry would
+// queue each stream trace behind the previous ones, and our own queue would be
+// measured as Sentry's latency. Each stream send gets its own client; the
+// barrier answers only once every send's request is in flight together.
+func TestStreamSDKSendDoesNotQueueBehindASlowSentry(t *testing.T) {
+	const sends = 4
+	srv, stuck := newBarrierServer(t, sends)
+	send := streamSDKSend("http://public@"+strings.TrimPrefix(srv.URL, "http://")+"/1", "B1", &deliveryStats{})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, sends)
+	for i := 0; i < sends; i++ {
+		wg.Add(1)
+		go func(seq int) {
+			defer wg.Done()
+			_, _, err := send(context.Background(), seq)
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("send: %v", err)
+		}
+	}
+	if n := stuck.Load(); n > 0 {
+		t.Errorf("%d requests waited at the barrier for the others: sends were queued behind each other", n)
 	}
 }

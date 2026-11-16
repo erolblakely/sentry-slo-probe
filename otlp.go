@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -140,72 +141,75 @@ func otlpPartialSuccess(resp *http.Response) error {
 // otlpSender sends probe traces over OTLP. One per stream, shared by its send
 // workers.
 type otlpSender struct {
-	tp       *sdktrace.TracerProvider
-	tracer   trace.Tracer
-	delivery *deliveryLog
-	// flushTimeout is how long a send waits for its spans to be exported.
-	flushTimeout time.Duration
+	tp        *sdktrace.TracerProvider
+	tracer    trace.Tracer
+	exporter  sdktrace.SpanExporter
+	collected *traceCollector
+	delivery  *deliveryLog
 }
 
-// newOTLPSender builds an OTLP sender for the project in dsn.
+// newOTLPSender builds an OTLP sender for the project in dsn, counting
+// unanswered requests and retries into stats.
+func newOTLPSender(dsn string, stats *deliveryStats) (*otlpSender, error) {
+	return newOTLPSenderWith(dsn, stats, sdktrace.AlwaysSample())
+}
+
+// newOTLPSenderWith is newOTLPSender with the sampler as a parameter. The probe
+// always samples everything; the parameter lets a test stand in for spans lost
+// on our side.
 //
-// The exporter's retries are off, as the Sentry SDK has none, so each request's
-// outcome is final and deliveryLog classifies it exactly as for the SDK path.
-// A batch processor, as a real OTel app would use, flushed after each trace.
-// The sampler and batch settings are pinned so OTEL_TRACES_SAMPLER and
-// OTEL_BSP_* in the environment cannot change what the probe sends: a sampler
-// would silently drop traces, which would read as sends that never left.
-func newOTLPSender(dsn string) (*otlpSender, error) {
+// Each trace is exported in its own request, directly, not through a batch
+// span processor. A processor flushed per send runs its exports one at a time
+// under a lock, a few traces each, so a slow Sentry built a queue on our side
+// whose wait was measured as Sentry's latency, and the slowest sends fell out
+// of the sample. One request per trace, concurrently, mirrors the SDK stream's
+// client per send: neither path can queue behind itself, and each send's
+// outcome is its own request's.
+//
+// The exporter's retries are off, as the Sentry SDK has none, so a request's
+// outcome is final. The HTTP client's timeout, streamClientTimeout, sits beyond
+// the delivery log's answer timer, which is what decides an unanswered request.
+// (otlptracehttp's WithTimeout applies only to a client it builds itself, so it
+// is not set.)
+//
+// Concurrent sends share one exporter. otlptracehttp v1.42's ExportSpans takes
+// no lock and builds a fresh request per call, so that is safe, but it is that
+// implementation's behaviour, not a SpanExporter guarantee: the -race barrier
+// test (TestOTLPSenderDoesNotQueueBehindASlowSentry) guards it across upgrades.
+func newOTLPSenderWith(dsn string, stats *deliveryStats, sampler sdktrace.Sampler) (*otlpSender, error) {
 	endpoint, key, err := otlpEndpointFromDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	d := newDeliveryLog(nil, otlpTraces)
+	d := newDeliveryLog(streamTransport, otlpTraces, streamDeliveryPolicy(stats))
 	exp, err := otlptracehttp.New(context.Background(),
 		otlptracehttp.WithEndpointURL(endpoint),
 		otlptracehttp.WithHeaders(map[string]string{"x-sentry-auth": "sentry sentry_key=" + key}),
 		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: false}),
-		otlptracehttp.WithHTTPClient(&http.Client{Transport: d, Timeout: batchFlushTimeout}),
+		otlptracehttp.WithHTTPClient(&http.Client{Transport: d, Timeout: streamClientTimeout}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("otlp exporter: %w", err)
 	}
+	c := &traceCollector{spans: make(map[trace.TraceID][]sdktrace.ReadOnlySpan)}
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithBatcher(exp,
-			sdktrace.WithBatchTimeout(5*time.Second),
-			sdktrace.WithMaxQueueSize(2048),
-			sdktrace.WithMaxExportBatchSize(512),
-			sdktrace.WithExportTimeout(30*time.Second),
-		),
+		sdktrace.WithSampler(sampler),
+		sdktrace.WithSpanProcessor(c),
 		sdktrace.WithResource(resource.NewSchemaless(attribute.String("service.name", "sentry-slo-probe"))),
 	)
-	return &otlpSender{tp: tp, tracer: tp.Tracer("sentry-slo-probe"), delivery: d, flushTimeout: batchFlushTimeout}, nil
+	return &otlpSender{tp: tp, tracer: tp.Tracer("sentry-slo-probe"), exporter: exp, collected: c, delivery: d}, nil
 }
 
 // send sends one probe trace (a probe.login root with n child spans, the same
-// shape as sendTraceTagged) and returns its trace id and send stamp.
+// shape as sendTraceTagged) in one export request, and returns its trace id and
+// send stamp. It returns once that request has been answered or abandoned, so
+// nothing it started outlives it.
 //
-// When ForceFlush returns, every span ended before it has been exported: the
-// batch processor moves spans queued ahead of the flush marker into its batch
-// before the flush proceeds, and both its own exports and the flush's export
-// run under the same batch lock, so whichever requests carried this trace's
-// spans have completed and been recorded. The trace counts as sent only if all
-// n+1 of its spans were accepted (deliveryLog.confirm): its children can go
-// out in an earlier request than its root, and a span our side dropped
-// without any request counts against it too.
-//
-// ForceFlush runs on a background context, and the send waits for it on its
-// own timer. Its context becomes the export request's, and one request carries
-// every worker's queued spans: a per-send deadline would let one send's timeout
-// cancel a request carrying other traces, or leave an export that runs later
-// with an expired context and discards the batch without sending it. Requests
-// are bounded by the HTTP client's timeout instead. A send that gives up leaves
-// its flush running; it ends within that timeout, or at Close.
-//
-// ForceFlush's error does not decide the send: it can belong to another
-// trace's spans, and it reports a Sentry 5xx, which counts as sent. It is
-// logged for the detail it carries (such as a 4xx body).
+// The trace counts as sent only if all n+1 spans were accepted
+// (deliveryLog.confirm), which also catches spans lost on our side before the
+// export. The exporter's own error does not decide the send: it reports a
+// Sentry 5xx, which counts as sent. It is logged for the detail it carries
+// (such as a 4xx body).
 func (o *otlpSender) send(batchKey string, seq, n int) (string, time.Time, error) {
 	ctx, root := o.tracer.Start(context.Background(), "probe.login",
 		trace.WithSpanKind(trace.SpanKindServer),
@@ -219,23 +223,14 @@ func (o *otlpSender) send(batchKey string, seq, n int) (string, time.Time, error
 		child.End()
 	}
 	root.End()
-	traceID := root.SpanContext().TraceID().String()
-	// Stamped before the flush, as sendTraceTagged does, so both streams
-	// measure from the same point and a flush that waits on a peer's spans
-	// cannot shorten this trace's latency.
+	tid := root.SpanContext().TraceID()
+	traceID := tid.String()
+	spans := o.collected.take(tid)
+	// Stamped just before the request goes out, as sendTraceTagged stamps
+	// before its flush, so both streams measure from the same point.
 	sentAt := time.Now()
-
-	flushed := make(chan error, 1)
-	go func() { flushed <- o.tp.ForceFlush(context.Background()) }()
-	timer := time.NewTimer(o.flushTimeout)
-	defer timer.Stop()
-	select {
-	case err := <-flushed:
-		if err != nil {
-			log.Printf("[%s] flush after trace %s: %v", traceStreamOTLPSignal, traceID, err)
-		}
-	case <-timer.C:
-		return "", time.Time{}, fmt.Errorf("flush otlp trace %s: export did not finish within %s", traceID, o.flushTimeout)
+	if err := o.exporter.ExportSpans(context.Background(), spans); err != nil {
+		log.Printf("[%s] export trace %s: %v", traceStreamOTLPSignal, traceID, err)
 	}
 	if err := o.delivery.confirm(traceID, n+1, "otlp trace"); err != nil {
 		return "", time.Time{}, err
@@ -243,9 +238,38 @@ func (o *otlpSender) send(batchKey string, seq, n int) (string, time.Time, error
 	return traceID, sentAt, nil
 }
 
-// Close flushes and shuts down the sender's provider and exporter.
+// Close shuts down the sender's provider and exporter.
 func (o *otlpSender) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = o.tp.Shutdown(ctx)
+	_ = o.exporter.Shutdown(ctx)
 }
+
+// traceCollector is a span processor that holds each trace's ended spans until
+// its send takes them for export, so one trace goes out as one request.
+type traceCollector struct {
+	mu    sync.Mutex
+	spans map[trace.TraceID][]sdktrace.ReadOnlySpan
+}
+
+func (c *traceCollector) OnStart(context.Context, sdktrace.ReadWriteSpan) {}
+
+func (c *traceCollector) OnEnd(s sdktrace.ReadOnlySpan) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id := s.SpanContext().TraceID()
+	c.spans[id] = append(c.spans[id], s)
+}
+
+// take returns and forgets the ended spans of trace id.
+func (c *traceCollector) take(id trace.TraceID) []sdktrace.ReadOnlySpan {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	spans := c.spans[id]
+	delete(c.spans, id)
+	return spans
+}
+
+func (c *traceCollector) Shutdown(context.Context) error   { return nil }
+func (c *traceCollector) ForceFlush(context.Context) error { return nil }

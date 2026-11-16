@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"testing"
@@ -213,7 +217,7 @@ func TestSendErrorEventConfirmsDelivery(t *testing.T) {
 // never confirmed) must not accumulate for the life of a stream's client.
 func TestDeliveryLogForgetsStaleOutcomes(t *testing.T) {
 	clk := &fakeClock{t: streamT0}
-	d := newDeliveryLog(nil, sentryEnvelopes)
+	d := newDeliveryLog(nil, sentryEnvelopes, deliveryPolicy{})
 	d.now = clk.now
 
 	d.record(map[string]int{"old": 1}, nil)
@@ -238,7 +242,7 @@ func TestDeliveryLogForgetsStaleOutcomes(t *testing.T) {
 // sample shrinks exactly when Sentry is slow enough for traces to share a
 // request.
 func TestDeliveryLogSharedRequestConfirmsEachTrace(t *testing.T) {
-	d := newDeliveryLog(nil, otlpTraces)
+	d := newDeliveryLog(nil, otlpTraces, deliveryPolicy{})
 	d.record(map[string]int{"a": 5, "b": 5, "c": 5}, nil)
 	for _, k := range []string{"a", "b", "c"} {
 		if err := d.confirm(k, 5, "otlp trace"); err != nil {
@@ -281,7 +285,7 @@ func TestDeliveryLogMergesATraceSplitAcrossRequests(t *testing.T) {
 		}{{1, nil}}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			d := newDeliveryLog(nil, otlpTraces)
+			d := newDeliveryLog(nil, otlpTraces, deliveryPolicy{})
 			for _, r := range c.requests {
 				d.record(map[string]int{"tr": r.spans}, r.err)
 			}
@@ -380,5 +384,185 @@ func TestDeliveryConfirmationUnderConcurrentFlushes(t *testing.T) {
 	mu.Unlock()
 	if rejected != wantRejected || accepted+rejected != 160 {
 		t.Errorf("accepted = %d, rejected = %d, want %d rejected of 160 (what the server rejected)", accepted, rejected, wantRejected)
+	}
+}
+
+// TestDeliveryNoAnswerAfterSendingCountsAsSent pins where our failure ends and
+// Sentry's begins when there is no response at all. Once the whole request
+// has been handed to Sentry's endpoint, a missing answer is Sentry's ingest
+// failing: a slow Sentry must read as slow or lost, never be quietly dropped
+// from the sample as if we had failed to send. A request that never got that
+// far (refused, unreachable) is still ours.
+func TestDeliveryNoAnswerAfterSendingCountsAsSent(t *testing.T) {
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		<-release
+	}))
+	// Cleanups run last-in first-out: release the handler before Close, which
+	// waits for in-flight handlers.
+	t.Cleanup(hang.Close)
+	t.Cleanup(func() { close(release) })
+
+	post := func(url string) *deliveryLog {
+		d := newDeliveryLog(nil, otlpTraces, deliveryPolicy{answerTimeout: 100 * time.Millisecond})
+		c := &http.Client{Transport: d, Timeout: 5 * time.Second}
+		body := otlpBody(t, "0af7651916cd43dd8448eb211c80319c", 5)
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if resp, err := c.Do(req); err == nil {
+			resp.Body.Close()
+			t.Fatalf("request to %s unexpectedly succeeded", url)
+		}
+		return d
+	}
+
+	if err := post(hang.URL).confirm("0af7651916cd43dd8448eb211c80319c", 5, "otlp trace"); err != nil {
+		t.Errorf("no answer after the request was sent: %v; Sentry's silence must count as sent", err)
+	}
+	if err := post("http://"+strings.TrimPrefix(refusedDSN(t), "http://public@")).confirm("0af7651916cd43dd8448eb211c80319c", 5, "otlp trace"); err == nil {
+		t.Error("a refused connection counted as sent; the request never reached Sentry")
+	}
+}
+
+// scriptedRT is a fake connection that drives net/http's trace hooks the way a
+// real transport does: one GotConn per attempt, WroteRequest when an attempt's
+// write finishes, then an answer, an error, or silence until the request's
+// context ends.
+type scriptedRT struct {
+	attempts []attempt
+	status   int   // final answer, if err is nil and hang is false
+	err      error // final transport error
+	hang     bool  // never answer; return the context's error when it ends
+	// rewound: after the attempts, rewind the body (r.GetBody), as net/http
+	// does the moment it decides to retry, before any backoff or redial.
+	rewound bool
+}
+
+type attempt struct {
+	written  bool  // the write finished
+	writeErr error // the write failed partway
+}
+
+func (s scriptedRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	tr := httptrace.ContextClientTrace(r.Context())
+	for _, a := range s.attempts {
+		tr.GotConn(httptrace.GotConnInfo{})
+		if a.written || a.writeErr != nil {
+			tr.WroteRequest(httptrace.WroteRequestInfo{Err: a.writeErr})
+		}
+	}
+	if s.rewound {
+		if body, err := r.GetBody(); err == nil {
+			body.Close()
+		}
+	}
+	if s.hang {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &http.Response{StatusCode: s.status, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}}, nil
+}
+
+// deliver sends one scripted request for trace "tr" (5 spans) through a
+// delivery log with policy, and reports whether it counted as sent.
+func deliver(t *testing.T, rt scriptedRT, policy deliveryPolicy) bool {
+	t.Helper()
+	d := newDeliveryLog(rt, otlpTraces, policy)
+	req, _ := http.NewRequest(http.MethodPost, "http://x/v1/traces", bytes.NewReader(otlpBody(t, "0af7651916cd43dd8448eb211c80319c", 5)))
+	if resp, err := d.RoundTrip(req); err == nil {
+		resp.Body.Close()
+	}
+	return d.confirm("0af7651916cd43dd8448eb211c80319c", 5, "otlp trace") == nil
+}
+
+var streamPolicyForTest = deliveryPolicy{answerTimeout: 50 * time.Millisecond}
+
+// TestDeliveryUnansweredRule pins which missing answers are Sentry's. Under
+// the streams' policy, only one is: the whole request was written and Sentry
+// had not answered when the probe's own answer timer ran out. Everything else
+// that ends without an answer is ours, or at least not provably Sentry's: a
+// write that failed, a reset or close after the write (our egress dying, an
+// idle connection closed under us), a refused attempt. The batch probes keep
+// the old rule: any transport error is not sent.
+func TestDeliveryUnansweredRule(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		rt       scriptedRT
+		policy   deliveryPolicy
+		wantSent bool
+	}{
+		{"written, then no answer before the stream's timer", scriptedRT{attempts: []attempt{{written: true}}, hang: true}, streamPolicyForTest, true},
+		{"written, then reset", scriptedRT{attempts: []attempt{{written: true}}, err: errors.New("read: connection reset by peer")}, streamPolicyForTest, false},
+		{"written, then EOF", scriptedRT{attempts: []attempt{{written: true}}, err: io.ErrUnexpectedEOF}, streamPolicyForTest, false},
+		{"write failed partway, then no answer", scriptedRT{attempts: []attempt{{writeErr: errors.New("broken pipe")}}, hang: true}, streamPolicyForTest, false},
+		{"never connected, timer ran out", scriptedRT{hang: true}, streamPolicyForTest, false},
+		// net/http retries some fully written HTTP/2 requests on a new attempt
+		// (REFUSED_STREAM, GOAWAY). Only the final attempt's write counts.
+		{"earlier attempt written, final attempt not", scriptedRT{attempts: []attempt{{written: true}, {}}, hang: true}, streamPolicyForTest, false},
+		{"retried, final attempt written and answered", scriptedRT{attempts: []attempt{{written: true}, {written: true}}, status: 200}, streamPolicyForTest, true},
+		// A refused stream that net/http has decided to retry: the timer can run
+		// out during the retry backoff or the redial, before the next attempt
+		// connects. The refused attempt must not count as written.
+		{"written, refused, timer ran out while the retry was pending", scriptedRT{attempts: []attempt{{written: true}}, rewound: true, hang: true}, streamPolicyForTest, false},
+		// The batch probes' rule is unchanged: no answer is never sent.
+		{"batch policy: written, then no answer", scriptedRT{attempts: []attempt{{written: true}}, err: context.DeadlineExceeded}, deliveryPolicy{}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := deliver(t, c.rt, c.policy); got != c.wantSent {
+				t.Errorf("counted as sent = %t, want %t", got, c.wantSent)
+			}
+		})
+	}
+}
+
+// TestDeliveryStatsCountUnansweredAndRetries: both are published as probe
+// health, so a slow Sentry (unanswered) and net/http retrying on our shared
+// connection (a possible source of duplicates) are visible, not inferred.
+func TestDeliveryStatsCountUnansweredAndRetries(t *testing.T) {
+	stats := &deliveryStats{}
+	policy := deliveryPolicy{answerTimeout: 50 * time.Millisecond, stats: stats}
+	deliver(t, scriptedRT{attempts: []attempt{{written: true}}, hang: true}, policy)
+	deliver(t, scriptedRT{attempts: []attempt{{written: true}, {written: true}}, status: 200}, policy)
+	deliver(t, scriptedRT{attempts: []attempt{{written: true}}, status: 200}, policy)
+
+	if unanswered, retried := stats.take(); unanswered != 1 || retried != 1 {
+		t.Errorf("take() = %d unanswered, %d retried; want 1 and 1", unanswered, retried)
+	}
+	if unanswered, retried := stats.take(); unanswered != 0 || retried != 0 {
+		t.Errorf("second take() = %d, %d; want 0, 0 (take resets)", unanswered, retried)
+	}
+}
+
+// TestOnlyStreamClientsTreatUnansweredAsSent: the streams' rule for unanswered
+// requests (and their transport) must not leak into the batch probes, whose
+// rule is unchanged: any transport error is not sent.
+func TestOnlyStreamClientsTreatUnansweredAsSent(t *testing.T) {
+	dsn := "http://public@127.0.0.1:9/1"
+	batch, err := newTracingClient(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer batch.Close()
+	stream, err := newStreamTracingClient(dsn, &deliveryStats{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	o, err := newOTLPSender(dsn, &deliveryStats{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.Close()
+
+	if p := batch.delivery.policy; p.answerTimeout != 0 || batch.delivery.next != http.DefaultTransport {
+		t.Errorf("batch client policy = %+v over %T, want the zero policy over http.DefaultTransport", p, batch.delivery.next)
+	}
+	for name, d := range map[string]*deliveryLog{"sdk stream": stream.delivery, "otlp stream": o.delivery} {
+		if d.policy.answerTimeout != streamAnswerTimeout || d.policy.stats == nil || d.next != http.RoundTripper(streamTransport) {
+			t.Errorf("%s policy = %+v over %T, want streamAnswerTimeout with stats over streamTransport", name, d.policy, d.next)
+		}
 	}
 }

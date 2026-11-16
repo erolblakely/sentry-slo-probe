@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"encoding/hex"
 	"io"
 	"maps"
@@ -12,10 +11,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
@@ -139,7 +138,7 @@ func (f *fakeOTLP) dsn() string {
 
 func newTestOTLPSender(t *testing.T, dsn string) *otlpSender {
 	t.Helper()
-	o, err := newOTLPSender(dsn)
+	o, err := newOTLPSender(dsn, &deliveryStats{})
 	if err != nil {
 		t.Fatalf("newOTLPSender: %v", err)
 	}
@@ -309,76 +308,6 @@ func sendConcurrently(o *otlpSender, workers, perWorker int) (ids []string, errs
 	return ids, errs
 }
 
-// TestOTLPSenderConcurrentSendsSharingRequests: with a slow endpoint, the
-// batch processor puts several workers' traces in one export request, and can
-// split one trace's spans across requests. Every send must still be judged by
-// what happened to its own spans.
-func TestOTLPSenderConcurrentSendsSharingRequests(t *testing.T) {
-	t.Run("all accepted", func(t *testing.T) {
-		ingest := newSlowOTLP(t, 100*time.Millisecond, func(int) int { return http.StatusOK }, nil)
-		o := newTestOTLPSender(t, ingest.dsn())
-		_, errs := sendConcurrently(o, 8, 4)
-		for _, err := range errs {
-			if err != nil {
-				t.Errorf("send failed although every request got a 200: %v", err)
-			}
-		}
-		shared := false
-		for _, r := range ingest.requests() {
-			shared = shared || len(r.spans) > 1
-		}
-		if !shared {
-			t.Fatal("no request carried more than one trace; the test did not exercise sharing")
-		}
-	})
-
-	// Alternate 200 and 400 by request. A trace counts as sent exactly when
-	// all 5 of its spans arrived, and only in 200 requests.
-	t.Run("per-request outcomes", func(t *testing.T) {
-		statusFor := func(n int) int {
-			if n%2 == 1 {
-				return http.StatusBadRequest
-			}
-			return http.StatusOK
-		}
-		ingest := newSlowOTLP(t, 60*time.Millisecond, statusFor, nil)
-		o := newTestOTLPSender(t, ingest.dsn())
-		ids, errs := sendConcurrently(o, 8, 4)
-
-		accepted, rejected := map[string]int{}, map[string]bool{}
-		for _, r := range ingest.requests() {
-			for id, n := range r.spans {
-				if r.status == http.StatusOK {
-					accepted[id] += n
-				} else {
-					rejected[id] = true
-				}
-			}
-		}
-		wantSent := map[string]bool{}
-		for id, n := range accepted {
-			if n >= 5 && !rejected[id] {
-				wantSent[id] = true
-			}
-		}
-		gotSent := 0
-		for i, err := range errs {
-			if err == nil {
-				gotSent++
-				if !wantSent[ids[i]] {
-					t.Errorf("trace %s counted as sent, but not all its spans were accepted", ids[i])
-				}
-			}
-		}
-		if gotSent != len(wantSent) {
-			t.Errorf("%d sends counted as sent, want %d (traces whose spans were all accepted)", gotSent, len(wantSent))
-		}
-		if len(wantSent) == 0 || len(wantSent) == len(errs) {
-			t.Fatalf("%d of %d traces fully accepted; the test needs a mix", len(wantSent), len(errs))
-		}
-	})
-}
-
 // TestOTLPSenderPartialSuccess: OTLP lets a 200 reject spans in its body
 // (partial_success). Sentry explicitly refused them, as with a 4xx, so the
 // request's traces do not count as sent. The response does not say which
@@ -404,32 +333,6 @@ func TestOTLPSenderPartialSuccess(t *testing.T) {
 	}
 }
 
-// TestOTLPSenderFlushDeadlineDoesNotCancelTheExport: a send that gives up
-// waiting must not cancel the export request it was waiting on. That request
-// can carry other traces, and cancelling it (or a later export reusing the
-// expired deadline) would fail or drop their spans: our own failure, read as
-// Sentry's.
-func TestOTLPSenderFlushDeadlineDoesNotCancelTheExport(t *testing.T) {
-	ingest := newSlowOTLP(t, 300*time.Millisecond, func(int) int { return http.StatusOK }, nil)
-	o := newTestOTLPSender(t, ingest.dsn())
-	o.flushTimeout = 50 * time.Millisecond
-
-	if _, _, err := o.send("B1", 0, 4); err == nil {
-		t.Fatal("send returned before a 300ms export although it waits at most 50ms")
-	}
-	time.Sleep(600 * time.Millisecond)
-
-	reqs := ingest.requests()
-	if len(reqs) != 1 || len(reqs[0].spans) != 1 {
-		t.Fatalf("ingest saw %d requests, want one carrying the trace", len(reqs))
-	}
-	for id := range reqs[0].spans {
-		if err := o.delivery.confirm(id, 5, "otlp trace"); err != nil {
-			t.Errorf("the export the timed-out send was waiting on did not complete as accepted: %v", err)
-		}
-	}
-}
-
 // dropChildren samples the probe's root span and drops its children, standing
 // in for any way our side can lose spans without a request (a stale export
 // discarding a batch, a sampler, a full queue).
@@ -450,16 +353,10 @@ func (dropChildren) Description() string { return "dropChildren" }
 // the trace incomplete and charge Sentry for spans it never received.
 func TestOTLPSenderRequiresEverySpan(t *testing.T) {
 	ingest := newSlowOTLP(t, 0, func(int) int { return http.StatusOK }, nil)
-	d := newDeliveryLog(nil, otlpTraces)
-	exp, err := otlptracehttp.New(context.Background(),
-		otlptracehttp.WithEndpointURL(ingest.srv.URL+"/api/1/integration/otlp/v1/traces"),
-		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: false}),
-		otlptracehttp.WithHTTPClient(&http.Client{Transport: d}))
+	o, err := newOTLPSenderWith(ingest.dsn(), &deliveryStats{}, dropChildren{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(dropChildren{}), sdktrace.WithBatcher(exp))
-	o := &otlpSender{tp: tp, tracer: tp.Tracer("test"), delivery: d, flushTimeout: 5 * time.Second}
 	t.Cleanup(o.Close)
 
 	if _, _, err := o.send("B1", 0, 4); err == nil {
@@ -468,4 +365,115 @@ func TestOTLPSenderRequiresEverySpan(t *testing.T) {
 	if reqs := ingest.requests(); len(reqs) != 1 {
 		t.Fatalf("ingest saw %d requests, want 1 carrying the root alone", len(reqs))
 	}
+}
+
+// otlpBody is an OTLP export request carrying spans spans of one trace.
+func otlpBody(t *testing.T, traceID string, spans int) []byte {
+	t.Helper()
+	var ss []*tracepb.Span
+	for i := 0; i < spans; i++ {
+		ss = append(ss, &tracepb.Span{TraceId: traceIDBytes(t, traceID), Name: "s"})
+	}
+	b, err := proto.Marshal(&coltracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{ScopeSpans: []*tracepb.ScopeSpans{{Spans: ss}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestOTLPSenderSendsEachTraceAlone: each send is its own export request
+// carrying exactly its own trace, so its outcome is that request's alone, and
+// per-request outcomes map one to one onto sends.
+func TestOTLPSenderSendsEachTraceAlone(t *testing.T) {
+	statusFor := func(n int) int {
+		if n%2 == 1 {
+			return http.StatusBadRequest
+		}
+		return http.StatusOK
+	}
+	ingest := newSlowOTLP(t, 20*time.Millisecond, statusFor, nil)
+	o := newTestOTLPSender(t, ingest.dsn())
+	ids, errs := sendConcurrently(o, 8, 4)
+
+	accepted := map[string]bool{}
+	for _, r := range ingest.requests() {
+		if len(r.spans) != 1 {
+			t.Errorf("a request carried %d traces, want exactly 1", len(r.spans))
+		}
+		for id, n := range r.spans {
+			if n != 5 {
+				t.Errorf("trace %s went out as %d spans in one request, want all 5", id, n)
+			}
+			accepted[id] = r.status == http.StatusOK
+		}
+	}
+	sent := 0
+	for i, err := range errs {
+		if err == nil {
+			sent++
+			if !accepted[ids[i]] {
+				t.Errorf("trace %s counted as sent, but its request was rejected", ids[i])
+			}
+		}
+	}
+	want := 0
+	for _, ok := range accepted {
+		if ok {
+			want++
+		}
+	}
+	if sent != want || want == 0 || want == len(errs) {
+		t.Errorf("%d of %d sends counted as sent, want %d (the accepted requests), and a mix", sent, len(errs), want)
+	}
+}
+
+// TestOTLPSenderDoesNotQueueBehindASlowSentry is the regression test for a
+// queue that used to form on our side. A batch span processor flushed per
+// send runs its exports one at a time under a lock, a few traces each, so a
+// slow Sentry made sends wait behind each other: that wait was measured as
+// Sentry's latency, and the slowest sends fell out of the sample. The barrier
+// answers only once every send's request is in flight at the same time, so any
+// serialization on our side fails this test outright.
+func TestOTLPSenderDoesNotQueueBehindASlowSentry(t *testing.T) {
+	const sends = 4
+	srv, stuck := newBarrierServer(t, sends)
+	o := newTestOTLPSender(t, "http://public@"+strings.TrimPrefix(srv.URL, "http://")+"/1")
+	_, errs := sendConcurrently(o, sends, 1)
+	for _, err := range errs {
+		if err != nil {
+			t.Errorf("send: %v", err)
+		}
+	}
+	if n := stuck.Load(); n > 0 {
+		t.Errorf("%d requests waited at the barrier for the others: sends were queued behind each other", n)
+	}
+}
+
+// newBarrierServer answers every request only once n requests are in flight
+// together, and counts those that gave up waiting (answering 400) in stuck.
+// Sends that are serialized on our side can never fill it.
+func newBarrierServer(t *testing.T, n int) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var mu sync.Mutex
+	arrived := 0
+	all := make(chan struct{})
+	stuck := &atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		mu.Lock()
+		arrived++
+		if arrived == n {
+			close(all)
+		}
+		mu.Unlock()
+		select {
+		case <-all:
+			w.WriteHeader(http.StatusOK)
+		case <-time.After(2 * time.Second):
+			stuck.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, stuck
 }
