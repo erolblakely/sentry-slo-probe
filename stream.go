@@ -84,6 +84,7 @@ func (w streamWindow) result() batchResult {
 // for concurrent use: sends record from worker goroutines while poll runs on
 // its own.
 type traceStream struct {
+	name    string // the stream's signal, which labels its log lines
 	timeout time.Duration
 	grace   time.Duration
 	now     func() time.Time
@@ -99,8 +100,9 @@ type traceStream struct {
 	w       streamWindow
 }
 
-func newTraceStream(timeout, grace time.Duration, now func() time.Time) *traceStream {
+func newTraceStream(name string, timeout, grace time.Duration, now func() time.Time) *traceStream {
 	return &traceStream{
+		name:    name,
 		timeout: timeout,
 		grace:   grace,
 		now:     now,
@@ -159,7 +161,7 @@ func (s *traceStream) poll(ctx context.Context, query traceQueryFunc) {
 		s.mu.Lock()
 		if err != nil {
 			s.w.queryFailed++
-			log.Printf("[trace_stream] query %d traces: %v", len(chunk), err)
+			log.Printf("[%s] query %d traces: %v", s.name, len(chunk), err)
 		} else {
 			s.w.queryOK++
 			s.observe(chunk, found, asked, answered)
@@ -209,7 +211,7 @@ func (s *traceStream) census(ctx context.Context, count spanCountFunc) {
 		s.mu.Lock()
 		if err != nil {
 			s.w.censusFailed++
-			log.Printf("[trace_stream] span census of %d traces: %v", len(chunk), err)
+			log.Printf("[%s] span census of %d traces: %v", s.name, len(chunk), err)
 		} else {
 			for _, id := range chunk {
 				s.w.censused++
@@ -375,7 +377,7 @@ func runTraceStream(ctx context.Context, cfg streamConfig, ts *traceStream, io s
 				defer func() { <-sem }()
 				id, at, err := io.send(ctx, seq)
 				if err != nil {
-					log.Printf("[trace_stream] send seq=%d: %v", seq, err)
+					log.Printf("[%s] send seq=%d: %v", ts.name, seq, err)
 				}
 				ts.recordSend(id, at, err)
 			}(seq)
@@ -534,7 +536,7 @@ func runStreamProbe(ctx context.Context, s *sentryProbe, cfg config, signal, str
 	// interval, and the stream submits every reporting window, not every
 	// PROBE_INTERVAL_SECONDS.
 	dd := newDatadogClient(cfg.ddAPIKey, cfg.ddSite, traceStreamReportInterval)
-	ts := newTraceStream(cfg.streamTimeout, traceStreamGrace, time.Now).
+	ts := newTraceStream(signal, cfg.streamTimeout, traceStreamGrace, time.Now).
 		withCensus(traceProbeSpans, traceStreamCensusSettle, traceStreamCensusGiveUp)
 
 	log.Printf("[%s] starting (send every %s, poll every %s, report every %s, lost after %s, census %s after arrival, probe_batch=%s)",

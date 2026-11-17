@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -40,7 +42,7 @@ const (
 
 func newTestStream() (*traceStream, *fakeClock) {
 	clk := &fakeClock{t: streamT0}
-	return newTraceStream(testStreamTimeout, testStreamGrace, clk.now), clk
+	return newTraceStream("trace_stream", testStreamTimeout, testStreamGrace, clk.now), clk
 }
 
 // findAll is a query that reports every requested trace as arrived.
@@ -320,7 +322,7 @@ func waitDone(t *testing.T, done <-chan struct{}) {
 func TestRunTraceStreamEndToEnd(t *testing.T) {
 	cfg := streamConfig{sendInterval: 10 * time.Millisecond, pollInterval: 5 * time.Millisecond, reportInterval: 40 * time.Millisecond, sendWorkers: 2}
 	// A 1ms settle, so traces become due for census within the run.
-	ts := newTraceStream(time.Second, time.Second, time.Now).withCensus(4, time.Millisecond, time.Minute)
+	ts := newTraceStream("trace_stream", time.Second, time.Second, time.Now).withCensus(4, time.Millisecond, time.Minute)
 	send := func(ctx context.Context, seq int) (string, time.Time, error) {
 		return fmt.Sprintf("t%d", seq), time.Now(), nil
 	}
@@ -365,7 +367,7 @@ func TestRunTraceStreamEndToEnd(t *testing.T) {
 // it did not cover, on the way out of a routine restart.
 func TestRunTraceStreamCancelWaitsForSendsAndDoesNotReport(t *testing.T) {
 	cfg := streamConfig{sendInterval: time.Hour, pollInterval: time.Hour, reportInterval: time.Hour, sendWorkers: 1}
-	ts := newTraceStream(time.Second, time.Second, time.Now)
+	ts := newTraceStream("trace_stream", time.Second, time.Second, time.Now)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	send := func(ctx context.Context, seq int) (string, time.Time, error) {
@@ -401,7 +403,7 @@ func TestRunTraceStreamCancelWaitsForSendsAndDoesNotReport(t *testing.T) {
 // skipped and counted.
 func TestRunTraceStreamSkipsWhenWorkersBusy(t *testing.T) {
 	cfg := streamConfig{sendInterval: 5 * time.Millisecond, pollInterval: time.Hour, reportInterval: 60 * time.Millisecond, sendWorkers: 1}
-	ts := newTraceStream(time.Second, time.Second, time.Now)
+	ts := newTraceStream("trace_stream", time.Second, time.Second, time.Now)
 	release := make(chan struct{})
 	var calls int
 	var mu sync.Mutex
@@ -917,5 +919,61 @@ func TestStreamSDKSendDoesNotQueueBehindASlowSentry(t *testing.T) {
 	}
 	if n := stuck.Load(); n > 0 {
 		t.Errorf("%d requests waited at the barrier for the others: sends were queued behind each other", n)
+	}
+}
+
+// captureLog redirects the standard logger for the duration of the test.
+func captureLog(t *testing.T) *strings.Builder {
+	t.Helper()
+	var buf strings.Builder
+	var mu sync.Mutex
+	log.SetOutput(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	}))
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return &buf
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// TestTraceStreamLogsUnderItsOwnName: two streams run side by side, and their
+// failed sends, lookups and census counts are logged per stream. A shared
+// hard-coded label filed the OTLP stream's failures under the SDK stream's
+// name, so the logs disagreed with the per-stream metrics.
+func TestTraceStreamLogsUnderItsOwnName(t *testing.T) {
+	logs := captureLog(t)
+	clk := &fakeClock{t: streamT0}
+	s := newTraceStream("trace_stream_otlp", testStreamTimeout, testStreamGrace, clk.now).
+		withCensus(4, testCensusSettle, testCensusGiveUp)
+
+	arriveAt(s, clk, streamT0.Add(50*time.Second), "a")
+	s.recordSend("b", streamT0, nil)
+	s.poll(context.Background(), failQuery)
+	clk.set(streamT0.Add(50*time.Second + testCensusSettle))
+	s.census(context.Background(), (&countsFrom{err: errUnauthorized}).count)
+
+	cfg := streamConfig{sendInterval: time.Hour, pollInterval: time.Hour, reportInterval: time.Hour, sendWorkers: 1}
+	sent := make(chan struct{})
+	failing := func(ctx context.Context, seq int) (string, time.Time, error) {
+		defer close(sent)
+		return "", time.Time{}, errors.New("refused")
+	}
+	stop, done := startStream(cfg, s, streamIO{send: failing, query: findAll}, &windowLog{})
+	<-sent
+	stop()
+	waitDone(t, done)
+
+	out := logs.String()
+	for _, want := range []string{"[trace_stream_otlp] query", "[trace_stream_otlp] span census", "[trace_stream_otlp] send seq="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log has no %q line:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "[trace_stream] ") {
+		t.Errorf("the OTLP stream logged under the SDK stream's name:\n%s", out)
 	}
 }
