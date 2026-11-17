@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -60,33 +61,42 @@ func newDatadogClient(apiKey, site string, interval time.Duration) *datadogClien
 	}
 }
 
+// metricPoint is one value for one metric, submitted at the current time.
+type metricPoint struct {
+	name  string
+	typ   int
+	value float64
+}
+
 // postMetric sends a single metric of the given type to the Datadog API (v2
 // series). See the ddType constants for which type belongs to which metric.
 func (d *datadogClient) postMetric(name string, metricType int, value float64, tags []string) error {
+	return d.postPoints([]metricPoint{{name, metricType, value}}, tags)
+}
+
+// postPoints sends points, all carrying tags, in one v2 series request.
+func (d *datadogClient) postPoints(points []metricPoint, tags []string) error {
 	if tags == nil {
 		tags = []string{}
 	}
-
-	series := map[string]any{
-		"metric": name,
-		"type":   metricType,
-		"points": []map[string]any{
-			{
-				"timestamp": time.Now().Unix(),
-				"value":     value,
-			},
-		},
-		"tags": tags,
+	now := time.Now().Unix()
+	series := make([]map[string]any, 0, len(points))
+	for _, p := range points {
+		sr := map[string]any{
+			"metric": p.name,
+			"type":   p.typ,
+			"points": []map[string]any{{"timestamp": now, "value": p.value}},
+			"tags":   tags,
+		}
+		// interval applies to count and rate only; Datadog ignores it on a
+		// gauge, so it is omitted there rather than sent as a meaningless number.
+		if p.typ == ddTypeCount {
+			sr["interval"] = d.intervalSeconds
+		}
+		series = append(series, sr)
 	}
-	// interval applies to count and rate only; Datadog ignores it on a gauge, so
-	// it is omitted there rather than sent as a meaningless number.
-	if metricType == ddTypeCount {
-		series["interval"] = d.intervalSeconds
-	}
 
-	payload := map[string]any{"series": []map[string]any{series}}
-
-	body, err := json.Marshal(payload)
+	body, err := json.Marshal(map[string]any{"series": series})
 	if err != nil {
 		return err
 	}
@@ -109,6 +119,21 @@ func (d *datadogClient) postMetric(name string, metricType int, value float64, t
 		return fmt.Errorf("datadog api returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// postPointsLogged posts points in one request and logs a failure, naming what
+// was lost: a dropped submission looks identical to a healthy gap otherwise.
+func (d *datadogClient) postPointsLogged(what string, points []metricPoint, tags []string) {
+	if len(points) == 0 {
+		return
+	}
+	if err := d.postPoints(points, tags); err != nil {
+		names := make([]string, len(points))
+		for i, p := range points {
+			names[i] = p.name
+		}
+		log.Printf("[datadog] post %d %s metrics: %v (lost: %s)", len(points), what, err, strings.Join(names, ", "))
+	}
 }
 
 // postMetricLogged posts a metric of the given type and logs any failure. Call
@@ -168,18 +193,34 @@ func (d *datadogClient) postBatchMetrics(signal string, res batchResult, baseTag
 	// Reliability is unaffected — sent, received and success_rate below are
 	// measured quantities even when received is 0, and must still be published so
 	// a genuine total loss burns error budget.
-	if len(res.latencies) > 0 {
-		d.postMetricLogged("sentry."+signal+".latency_ms.p50", ddTypeGauge, float64(percentile(res.latencies, 50).Milliseconds()), tags)
-		d.postMetricLogged("sentry."+signal+".latency_ms.p95", ddTypeGauge, float64(percentile(res.latencies, 95).Milliseconds()), tags)
-		d.postMetricLogged("sentry."+signal+".latency_ms.p99", ddTypeGauge, float64(percentile(res.latencies, 99).Milliseconds()), tags)
+	for _, p := range batchPoints(signal, res) {
+		d.postMetricLogged(p.name, p.typ, p.value, tags)
 	}
-	d.postMetricLogged("sentry."+signal+".sent", ddTypeCount, float64(res.sent), tags)
-	d.postMetricLogged("sentry."+signal+".received", ddTypeCount, float64(res.received), tags)
+}
+
+// batchPoints builds the latency and reliability points for one measured
+// batch (or stream window) of signal. Callers decide whether to publish at all
+// (postBatchMetrics' measured check, reportTraceStream's decided check).
+func batchPoints(signal string, res batchResult) []metricPoint {
+	var pts []metricPoint
+	// The latency percentiles: see the comment in postBatchMetrics on why they
+	// are omitted, not zeroed, when nothing arrived.
+	if len(res.latencies) > 0 {
+		pts = append(pts,
+			metricPoint{"sentry." + signal + ".latency_ms.p50", ddTypeGauge, float64(percentile(res.latencies, 50).Milliseconds())},
+			metricPoint{"sentry." + signal + ".latency_ms.p95", ddTypeGauge, float64(percentile(res.latencies, 95).Milliseconds())},
+			metricPoint{"sentry." + signal + ".latency_ms.p99", ddTypeGauge, float64(percentile(res.latencies, 99).Milliseconds())},
+		)
+	}
 	// sent is the count of sends that actually succeeded, so it can be 0 when a
 	// whole batch fails to send; guarding avoids submitting NaN.
 	rate := 0.0
 	if res.sent > 0 {
 		rate = float64(res.received) / float64(res.sent) * 100
 	}
-	d.postMetricLogged("sentry."+signal+".success_rate", ddTypeGauge, rate, tags)
+	return append(pts,
+		metricPoint{"sentry." + signal + ".sent", ddTypeCount, float64(res.sent)},
+		metricPoint{"sentry." + signal + ".received", ddTypeCount, float64(res.received)},
+		metricPoint{"sentry." + signal + ".success_rate", ddTypeGauge, rate},
+	)
 }

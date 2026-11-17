@@ -11,7 +11,8 @@
 #   sentry.<signal>.latency_ms.p50        (batch latency percentiles, ms; GAUGE)
 #   sentry.<signal>.latency_ms.p95
 #   sentry.<signal>.latency_ms.p99
-#   sentry.<signal>.sent                  (events that left the process; COUNT)
+#   sentry.<signal>.sent                  (events Sentry received: 2xx or its own
+#                                          5xx; COUNT)
 #   sentry.<signal>.received              (events that came back queryable; COUNT)
 #   sentry.<signal>.success_rate          (received/sent as a %; 0 when sent==0;
 #                                          GAUGE)
@@ -283,7 +284,9 @@ echo "  span-completeness monitor:         ${M_SPANS}"
 # success_rate is deliberately published as 0 when sent == 0 (received/sent is
 # NaN there, and a metric that never arrives looks identical to a healthy one on
 # a dashboard, so the probe posts an explicit 0 instead). But sent == 0 means
-# *our* send path failed — bad DSN, no egress, the SDK refusing to flush. A bare
+# *our* send path failed — bad DSN, no egress, the SDK refusing to flush, or
+# Sentry rate limiting us (429). A Sentry 5xx still counts as sent, so it reads
+# as a loss, as it should. A bare
 # "success_rate < N" monitor cannot tell that apart from Sentry dropping every
 # event, so it would page against Sentry for our own outage. That is the single
 # worst failure mode an SLO tool has: a confident false accusation.

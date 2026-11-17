@@ -95,6 +95,47 @@ func (s *sentryProbe) findTraceBatch(batchKey string, limit int) (map[string]boo
 	return s.findBatch(traceDataset, batchKey, "trace", limit)
 }
 
+// findTraces returns the subset of traceIDs whose root transaction Sentry has
+// ingested, in one request. The trace stream polls through here: it has no batch
+// tag to query by, so it names every pending trace explicitly, and the result
+// can never fill with traces that already arrived.
+//
+// is_transaction:true restricts the spans dataset to each trace's root span, so
+// a probe trace contributes one row however many children it carries. per_page
+// is the full page rather than len(traceIDs): the id filter already bounds the
+// rows, and the slack means a duplicated row cannot push a real arrival off the
+// page. Callers must pass at most maxSentryPerPage ids.
+func (s *sentryProbe) findTraces(traceIDs []string) (map[string]bool, error) {
+	// An empty trace:[] filter would match every transaction in the org.
+	if len(traceIDs) == 0 {
+		return map[string]bool{}, nil
+	}
+
+	q := url.Values{}
+	q.Set("dataset", traceDataset)
+	q.Set("statsPeriod", "1h")
+	q.Set("query", fmt.Sprintf("trace:[%s] is_transaction:true", strings.Join(traceIDs, ",")))
+	q.Set("field", "trace")
+	q.Set("per_page", strconv.Itoa(maxSentryPerPage))
+
+	endpoint := fmt.Sprintf("%s/api/0/organizations/%s/events/?%s",
+		s.baseURL, url.PathEscape(s.org), q.Encode())
+
+	var result struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := s.get(endpoint, &result); err != nil {
+		return nil, err
+	}
+	found := make(map[string]bool, len(result.Data))
+	for _, row := range result.Data {
+		if trace, _ := row["trace"].(string); trace != "" {
+			found[trace] = true
+		}
+	}
+	return found, nil
+}
+
 // findBatchSpanCounts returns traceID -> number of child spans stored, for the
 // given traces, in ONE request. is_transaction:false excludes each trace's root
 // transaction span, so the count is children only and comparable to the number

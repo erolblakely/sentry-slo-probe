@@ -24,4 +24,12 @@ services:
       PROBE_BATCH_SIZE: "${PROBE_BATCH_SIZE:-100}"
       PROBE_SEND_WINDOW_SECONDS: "${PROBE_SEND_WINDOW_SECONDS:-100}"
       SPAN_COMPLETENESS_SAMPLE: "${SPAN_COMPLETENESS_SAMPLE:-20}"
+      # The continuous trace stream: one trace per second (86,400/day). Set to
+      # false to switch it off; any value other than true/false is rejected.
+      TRACE_STREAM_ENABLED: "${TRACE_STREAM_ENABLED:-true}"
+      # The same stream over OpenTelemetry/OTLP to Sentry's OTLP endpoint
+      # (another 86,400/day).
+      TRACE_STREAM_OTLP_ENABLED: "${TRACE_STREAM_OTLP_ENABLED:-true}"
+      TRACE_STREAM_POLL_SECONDS: "${TRACE_STREAM_POLL_SECONDS:-2}"
+      TRACE_STREAM_TIMEOUT_SECONDS: "${TRACE_STREAM_TIMEOUT_SECONDS:-300}"
     restart: unless-stopped

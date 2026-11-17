@@ -224,3 +224,87 @@ func TestSampleTraceIDs(t *testing.T) {
 		t.Errorf("sampleTraceIDs(_, 0) = %v, want empty", got)
 	}
 }
+
+// TestFindTraces pins the query the trace stream polls with. It asks for the
+// listed traces by id rather than by tag, because a continuous stream has no
+// batch to tag: every pending trace is named explicitly, so the result can never
+// fill up with traces that already arrived.
+//
+// is_transaction:true is what makes per_page a trace count. The spans dataset
+// returns one row per span, and each probe trace carries child spans, so without
+// it a page of 100 rows would cover only a fraction of 100 traces and the rest
+// would read as "not arrived yet". Verified live on 2026-11-12: a 100-id
+// trace:[...] is_transaction:true query returned exactly one row per stored trace.
+func TestFindTraces(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if got := q.Get("dataset"); got != "spans" {
+			t.Errorf("dataset = %q, want spans", got)
+		}
+		if got := q.Get("query"); got != "trace:[aa,bb,cc] is_transaction:true" {
+			t.Errorf("query = %q, want trace:[aa,bb,cc] is_transaction:true", got)
+		}
+		if got := q["field"]; len(got) != 1 || got[0] != "trace" {
+			t.Errorf("field = %v, want [trace]", got)
+		}
+		// The full page, not len(ids): the id filter already bounds the rows, and
+		// a page sized to exactly one row per trace would let a duplicated row
+		// push a real arrival off the page, where it reads as "not arrived".
+		if got := q.Get("per_page"); got != "100" {
+			t.Errorf("per_page = %q, want 100", got)
+		}
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[{"trace":"aa"},{"trace":"cc"}]}`))
+	}))
+	defer srv.Close()
+
+	s := newSentryProbe("dsn", "tok", "org", "proj")
+	s.baseURL = srv.URL
+	found, err := s.findTraces([]string{"aa", "bb", "cc"})
+	if err != nil {
+		t.Fatalf("findTraces: %v", err)
+	}
+	if len(found) != 2 || !found["aa"] || !found["cc"] {
+		t.Errorf("found = %v, want {aa, cc}", found)
+	}
+}
+
+// TestFindTracesEmptyMakesNoRequest: an empty trace:[] filter would match every
+// transaction in the org and report traces as arrived that were never asked
+// about.
+func TestFindTracesEmptyMakesNoRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s for an empty id list", r.URL)
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer srv.Close()
+
+	s := newSentryProbe("dsn", "tok", "org", "proj")
+	s.baseURL = srv.URL
+	found, err := s.findTraces(nil)
+	if err != nil {
+		t.Fatalf("findTraces(nil): %v", err)
+	}
+	if len(found) != 0 {
+		t.Errorf("found = %v, want empty", found)
+	}
+}
+
+// TestFindTracesErrorsOnNon2xx: a rejected query must come back as an error, not
+// as an empty set. An empty set means "none of these have arrived", and the
+// stream would eventually count every one of them as lost by Sentry.
+func TestFindTracesErrorsOnNon2xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"detail":"Invalid token"}`))
+	}))
+	defer srv.Close()
+
+	s := newSentryProbe("dsn", "tok", "org", "proj")
+	s.baseURL = srv.URL
+	found, err := s.findTraces([]string{"aa"})
+	if err == nil {
+		t.Fatalf("findTraces returned %v and no error on a 401", found)
+	}
+}
