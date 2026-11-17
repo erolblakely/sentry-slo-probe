@@ -1,0 +1,860 @@
+{
+  "title": "Sentry ingestion SLO probe: trace streams",
+  "description": "One probe trace per second through the Sentry SDK and through OTLP: latency to queryable, reliability, child-span completeness, and probe health. Source: sentry-slo-probe, datadog/trace-streams-dashboard.json.",
+  "layout_type": "ordered",
+  "reflow_type": "fixed",
+  "template_variables": [
+    {
+      "name": "sentry_org",
+      "prefix": "sentry_org",
+      "available_values": [],
+      "default": "*"
+    },
+    {
+      "name": "sentry_project",
+      "prefix": "sentry_project",
+      "available_values": [],
+      "default": "*"
+    }
+  ],
+  "notify_list": [],
+  "widgets": [
+    {
+      "definition": {
+        "type": "note",
+        "content": "**Sentry ingestion SLO probe: trace streams.** Two streams each send one probe trace (a root plus 4 child spans) every second: **SDK** through the Sentry SDK, **OTLP** through OpenTelemetry to Sentry's OTLP endpoint. Each minute they report how long traces took to become queryable, how many arrived, and whether all child spans were stored.\n\nHealthy baseline (Nov 2026): p50 about 50s, p95 about 70-80s, about 60 traces in flight, 100% received and complete. Slowdowns show up as rising p95 and in-flight count on both streams together. `unanswered` counts sends Sentry did not answer within 25s (counted as sent); the other probe events are the probe's own trouble. Metric definitions: see the README section *The trace stream* in sentry-slo-probe.",
+        "background_color": "gray",
+        "font_size": "14",
+        "text_align": "left",
+        "vertical_align": "top",
+        "show_tick": false,
+        "tick_pos": "50%",
+        "tick_edge": "left",
+        "has_padding": true
+      },
+      "layout": {
+        "x": 0,
+        "y": 0,
+        "width": 12,
+        "height": 2
+      }
+    },
+    {
+      "definition": {
+        "type": "group",
+        "title": "Latency: send to queryable in Sentry (seconds)",
+        "layout_type": "ordered",
+        "show_title": true,
+        "widgets": [
+          {
+            "definition": {
+              "type": "timeseries",
+              "title": "p95 latency, SDK vs OTLP",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "p95_0",
+                      "query": "avg:sentry.trace_stream.latency_ms.p95{$sentry_org,$sentry_project}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "p95_1",
+                      "query": "avg:sentry.trace_stream_otlp.latency_ms.p95{$sentry_org,$sentry_project}"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "p95_0 / 1000",
+                      "alias": "SDK p95"
+                    },
+                    {
+                      "formula": "p95_1 / 1000",
+                      "alias": "OTLP p95"
+                    }
+                  ],
+                  "display_type": "line",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  }
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              },
+              "markers": [
+                {
+                  "value": "y = 120",
+                  "display_type": "warning dashed",
+                  "label": "120s"
+                }
+              ]
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 6,
+              "height": 4
+            }
+          },
+          {
+            "definition": {
+              "type": "timeseries",
+              "title": "p50 latency, SDK vs OTLP",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "p50_0",
+                      "query": "avg:sentry.trace_stream.latency_ms.p50{$sentry_org,$sentry_project}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "p50_1",
+                      "query": "avg:sentry.trace_stream_otlp.latency_ms.p50{$sentry_org,$sentry_project}"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "p50_0 / 1000",
+                      "alias": "SDK p50"
+                    },
+                    {
+                      "formula": "p50_1 / 1000",
+                      "alias": "OTLP p50"
+                    }
+                  ],
+                  "display_type": "line",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  }
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 6,
+              "y": 0,
+              "width": 6,
+              "height": 4
+            }
+          }
+        ]
+      },
+      "layout": {
+        "x": 0,
+        "y": 2,
+        "width": 12,
+        "height": 5
+      }
+    },
+    {
+      "definition": {
+        "type": "group",
+        "title": "Reliability: traces Sentry received that became queryable",
+        "layout_type": "ordered",
+        "show_title": true,
+        "widgets": [
+          {
+            "definition": {
+              "type": "query_value",
+              "title": "SDK: received / sent",
+              "title_size": "16",
+              "title_align": "left",
+              "precision": 2,
+              "autoscale": false,
+              "custom_unit": "%",
+              "requests": [
+                {
+                  "response_format": "scalar",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "rcv",
+                      "query": "sum:sentry.trace_stream.received{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "snt",
+                      "query": "sum:sentry.trace_stream.sent{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "100 * rcv / snt"
+                    }
+                  ],
+                  "conditional_formats": [
+                    {
+                      "comparator": ">=",
+                      "value": 99.9,
+                      "palette": "white_on_green"
+                    },
+                    {
+                      "comparator": "<",
+                      "value": 99.9,
+                      "palette": "white_on_red"
+                    }
+                  ]
+                }
+              ]
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 3,
+              "height": 3
+            }
+          },
+          {
+            "definition": {
+              "type": "query_value",
+              "title": "OTLP: received / sent",
+              "title_size": "16",
+              "title_align": "left",
+              "precision": 2,
+              "autoscale": false,
+              "custom_unit": "%",
+              "requests": [
+                {
+                  "response_format": "scalar",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "rcv",
+                      "query": "sum:sentry.trace_stream_otlp.received{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "snt",
+                      "query": "sum:sentry.trace_stream_otlp.sent{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "100 * rcv / snt"
+                    }
+                  ],
+                  "conditional_formats": [
+                    {
+                      "comparator": ">=",
+                      "value": 99.9,
+                      "palette": "white_on_green"
+                    },
+                    {
+                      "comparator": "<",
+                      "value": 99.9,
+                      "palette": "white_on_red"
+                    }
+                  ]
+                }
+              ]
+            },
+            "layout": {
+              "x": 3,
+              "y": 0,
+              "width": 3,
+              "height": 3
+            }
+          },
+          {
+            "definition": {
+              "type": "timeseries",
+              "title": "Lost traces per minute (sent - received)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "snt_0",
+                      "query": "sum:sentry.trace_stream.sent{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "rcv_0",
+                      "query": "sum:sentry.trace_stream.received{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "snt_1",
+                      "query": "sum:sentry.trace_stream_otlp.sent{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "rcv_1",
+                      "query": "sum:sentry.trace_stream_otlp.received{$sentry_org,$sentry_project}.as_count()"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "snt_0 - rcv_0",
+                      "alias": "SDK lost"
+                    },
+                    {
+                      "formula": "snt_1 - rcv_1",
+                      "alias": "OTLP lost"
+                    }
+                  ],
+                  "display_type": "bars",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  }
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 6,
+              "y": 0,
+              "width": 6,
+              "height": 3
+            }
+          }
+        ]
+      },
+      "layout": {
+        "x": 0,
+        "y": 7,
+        "width": 12,
+        "height": 4
+      }
+    },
+    {
+      "definition": {
+        "type": "group",
+        "title": "Span completeness: child spans stored, all-or-nothing per trace",
+        "layout_type": "ordered",
+        "show_title": true,
+        "widgets": [
+          {
+            "definition": {
+              "type": "query_value",
+              "title": "SDK: complete / checked",
+              "title_size": "16",
+              "title_align": "left",
+              "precision": 2,
+              "autoscale": false,
+              "custom_unit": "%",
+              "requests": [
+                {
+                  "response_format": "scalar",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "cmp",
+                      "query": "sum:sentry.trace_stream.census.complete{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "chk",
+                      "query": "sum:sentry.trace_stream.census.checked{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "100 * cmp / chk"
+                    }
+                  ],
+                  "conditional_formats": [
+                    {
+                      "comparator": ">=",
+                      "value": 99.9,
+                      "palette": "white_on_green"
+                    },
+                    {
+                      "comparator": "<",
+                      "value": 99.9,
+                      "palette": "white_on_red"
+                    }
+                  ]
+                }
+              ]
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 3,
+              "height": 3
+            }
+          },
+          {
+            "definition": {
+              "type": "query_value",
+              "title": "OTLP: complete / checked",
+              "title_size": "16",
+              "title_align": "left",
+              "precision": 2,
+              "autoscale": false,
+              "custom_unit": "%",
+              "requests": [
+                {
+                  "response_format": "scalar",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "cmp",
+                      "query": "sum:sentry.trace_stream_otlp.census.complete{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "chk",
+                      "query": "sum:sentry.trace_stream_otlp.census.checked{$sentry_org,$sentry_project}.as_count()",
+                      "aggregator": "sum"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "100 * cmp / chk"
+                    }
+                  ],
+                  "conditional_formats": [
+                    {
+                      "comparator": ">=",
+                      "value": 99.9,
+                      "palette": "white_on_green"
+                    },
+                    {
+                      "comparator": "<",
+                      "value": 99.9,
+                      "palette": "white_on_red"
+                    }
+                  ]
+                }
+              ]
+            },
+            "layout": {
+              "x": 3,
+              "y": 0,
+              "width": 3,
+              "height": 3
+            }
+          },
+          {
+            "definition": {
+              "type": "timeseries",
+              "title": "Traces with all 4 child spans stored (%)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "cmp_0",
+                      "query": "sum:sentry.trace_stream.census.complete{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "chk_0",
+                      "query": "sum:sentry.trace_stream.census.checked{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "cmp_1",
+                      "query": "sum:sentry.trace_stream_otlp.census.complete{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "chk_1",
+                      "query": "sum:sentry.trace_stream_otlp.census.checked{$sentry_org,$sentry_project}.as_count()"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "100 * cmp_0 / chk_0",
+                      "alias": "SDK complete"
+                    },
+                    {
+                      "formula": "100 * cmp_1 / chk_1",
+                      "alias": "OTLP complete"
+                    }
+                  ],
+                  "display_type": "line",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  }
+                }
+              ],
+              "yaxis": {
+                "include_zero": false,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 6,
+              "y": 0,
+              "width": 6,
+              "height": 3
+            }
+          }
+        ]
+      },
+      "layout": {
+        "x": 0,
+        "y": 11,
+        "width": 12,
+        "height": 4
+      }
+    },
+    {
+      "definition": {
+        "type": "group",
+        "title": "Probe health: about the probe, not Sentry",
+        "layout_type": "ordered",
+        "show_title": true,
+        "widgets": [
+          {
+            "definition": {
+              "type": "timeseries",
+              "title": "Traces in flight (healthy: ~60; climbs when Sentry slows)",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "pend_0",
+                      "query": "avg:sentry.trace_stream.probe.pending{$sentry_org,$sentry_project}"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "pend_1",
+                      "query": "avg:sentry.trace_stream_otlp.probe.pending{$sentry_org,$sentry_project}"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "pend_0",
+                      "alias": "SDK in flight"
+                    },
+                    {
+                      "formula": "pend_1",
+                      "alias": "OTLP in flight"
+                    }
+                  ],
+                  "display_type": "line",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  }
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 3
+            }
+          },
+          {
+            "definition": {
+              "type": "timeseries",
+              "title": "SDK stream: probe events per minute",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "send_failed",
+                      "query": "sum:sentry.trace_stream.probe.send_failed{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "send_skipped",
+                      "query": "sum:sentry.trace_stream.probe.send_skipped{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "unanswered",
+                      "query": "sum:sentry.trace_stream.probe.unanswered{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "http_retried",
+                      "query": "sum:sentry.trace_stream.probe.http_retried{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query_failed",
+                      "query": "sum:sentry.trace_stream.probe.query_failed{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "abandoned",
+                      "query": "sum:sentry.trace_stream.probe.abandoned{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "census_failed",
+                      "query": "sum:sentry.trace_stream.probe.census_failed{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "census_dropped",
+                      "query": "sum:sentry.trace_stream.probe.census_dropped{$sentry_org,$sentry_project}.as_count()"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "send_failed",
+                      "alias": "send_failed"
+                    },
+                    {
+                      "formula": "send_skipped",
+                      "alias": "send_skipped"
+                    },
+                    {
+                      "formula": "unanswered",
+                      "alias": "unanswered"
+                    },
+                    {
+                      "formula": "http_retried",
+                      "alias": "http_retried"
+                    },
+                    {
+                      "formula": "query_failed",
+                      "alias": "query_failed"
+                    },
+                    {
+                      "formula": "abandoned",
+                      "alias": "abandoned"
+                    },
+                    {
+                      "formula": "census_failed",
+                      "alias": "census_failed"
+                    },
+                    {
+                      "formula": "census_dropped",
+                      "alias": "census_dropped"
+                    }
+                  ],
+                  "display_type": "bars",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  }
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 0,
+              "y": 3,
+              "width": 6,
+              "height": 3
+            }
+          },
+          {
+            "definition": {
+              "type": "timeseries",
+              "title": "OTLP stream: probe events per minute",
+              "title_size": "16",
+              "title_align": "left",
+              "show_legend": true,
+              "legend_layout": "horizontal",
+              "legend_columns": [
+                "avg",
+                "max",
+                "value"
+              ],
+              "requests": [
+                {
+                  "response_format": "timeseries",
+                  "queries": [
+                    {
+                      "data_source": "metrics",
+                      "name": "send_failed",
+                      "query": "sum:sentry.trace_stream_otlp.probe.send_failed{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "send_skipped",
+                      "query": "sum:sentry.trace_stream_otlp.probe.send_skipped{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "unanswered",
+                      "query": "sum:sentry.trace_stream_otlp.probe.unanswered{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "http_retried",
+                      "query": "sum:sentry.trace_stream_otlp.probe.http_retried{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "query_failed",
+                      "query": "sum:sentry.trace_stream_otlp.probe.query_failed{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "abandoned",
+                      "query": "sum:sentry.trace_stream_otlp.probe.abandoned{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "census_failed",
+                      "query": "sum:sentry.trace_stream_otlp.probe.census_failed{$sentry_org,$sentry_project}.as_count()"
+                    },
+                    {
+                      "data_source": "metrics",
+                      "name": "census_dropped",
+                      "query": "sum:sentry.trace_stream_otlp.probe.census_dropped{$sentry_org,$sentry_project}.as_count()"
+                    }
+                  ],
+                  "formulas": [
+                    {
+                      "formula": "send_failed",
+                      "alias": "send_failed"
+                    },
+                    {
+                      "formula": "send_skipped",
+                      "alias": "send_skipped"
+                    },
+                    {
+                      "formula": "unanswered",
+                      "alias": "unanswered"
+                    },
+                    {
+                      "formula": "http_retried",
+                      "alias": "http_retried"
+                    },
+                    {
+                      "formula": "query_failed",
+                      "alias": "query_failed"
+                    },
+                    {
+                      "formula": "abandoned",
+                      "alias": "abandoned"
+                    },
+                    {
+                      "formula": "census_failed",
+                      "alias": "census_failed"
+                    },
+                    {
+                      "formula": "census_dropped",
+                      "alias": "census_dropped"
+                    }
+                  ],
+                  "display_type": "bars",
+                  "style": {
+                    "palette": "dog_classic",
+                    "line_type": "solid",
+                    "line_width": "normal"
+                  }
+                }
+              ],
+              "yaxis": {
+                "include_zero": true,
+                "scale": "linear"
+              }
+            },
+            "layout": {
+              "x": 6,
+              "y": 3,
+              "width": 6,
+              "height": 3
+            }
+          }
+        ]
+      },
+      "layout": {
+        "x": 0,
+        "y": 15,
+        "width": 12,
+        "height": 7
+      }
+    }
+  ]
+}
