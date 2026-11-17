@@ -254,6 +254,25 @@ A `skipping cycle` log line is not. It means a cycle outlived twice the interval
 
 Note that the probe writes real events into the target Sentry project and consumes quota. Point it at a dedicated project if that matters to you.
 
+## Datadog dashboard for the trace streams
+
+`datadog/trace-streams-dashboard.json` is a dashboard for both trace streams, side by side:
+
+- **Latency**: p50 and p95 seconds from send to queryable, SDK against OTLP, with a 120s reference line.
+- **Reliability**: received / sent over the selected time range (from the counts, so it is exact over any range), and lost traces per minute.
+- **Span completeness**: complete / checked over the range, and the share of traces with all 4 child spans stored.
+- **Probe health**: traces in flight (around 60 when healthy; it climbs when Sentry slows down), and each probe event per minute (`send_failed`, `unanswered`, `http_retried`, `query_failed`, and so on).
+
+It has `sentry_org` and `sentry_project` template variables and no monitors or notifications: it is for watching, not alerting. To import it, create a new dashboard in Datadog, open its settings (the cog), choose **Import dashboard JSON**, and paste the file. Or create it through the API with an application key:
+
+```bash
+curl -X POST "https://api.${DD_SITE:-datadoghq.com}/api/v1/dashboard" \
+  -H "DD-API-KEY: $DD_API_KEY" -H "DD-APPLICATION-KEY: $DD_APP_KEY" \
+  -H "Content-Type: application/json" -d @datadog/trace-streams-dashboard.json
+```
+
+Each re-import creates a new dashboard rather than updating one.
+
 ## Creating the Datadog SLOs
 
 `scripts/setup_datadog_slos.sh` creates monitors plus SLOs over the metrics above. It needs a Datadog **application** key in addition to the API key, and `jq`:
@@ -315,6 +334,7 @@ datadog.go       Datadog v2 series submission
 tracer.go        OTel → Datadog agentless OTLP setup (configured, emits no spans)
 batch.go         batch engine: paced sends, batched polling, latency tracking
 scripts/         Datadog monitor + SLO provisioning
+datadog/         dashboard for the trace streams (importable JSON)
 docs/            design doc and implementation plan
 ```
 
